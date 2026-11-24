@@ -108,6 +108,9 @@ pub fn run(
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    // Driver initialization can take seconds on a cold start. Do it before
+    // the title starts its watchdog and counts that work against startup.
+    victory_hle::modules::d3d12x::prepare_host().map_err(anyhow::Error::msg)?;
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);

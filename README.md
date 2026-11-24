@@ -130,6 +130,21 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
+The runtime checks the available hardware adapters for mesh shaders and shader
+model 6.6. If none qualifies, it uses Windows' WARP software renderer, provided
+that the installed WARP supports those features. This renders on the CPU and
+can be substantially slower. `VICTORY_D3D12_ADAPTER=hardware` forces the system's
+default adapter; `warp` forces software rendering; `auto` is the default.
+`VICTORY_D3D12_WARP=1` remains a software-rendering alias. These switches work
+in release builds as well as diagnostics builds. Failure to create a compatible
+device stops startup with an error instead of running without rendering.
+Software rendering needs WARP support for both 32- and 64-lane waves too.
+If the Windows-provided runtime is too old, download Microsoft's
+[WARP NuGet package](https://www.nuget.org/packages/Microsoft.Direct3D.WARP)
+and place `build/native/bin/x64/d3d10warp.dll` beside `victory.exe`, as described
+in the [WARP guide](https://learn.microsoft.com/en-us/windows/win32/direct3darticles/directx-warp).
+The DLL is installed locally and is not included in this repository.
+
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase

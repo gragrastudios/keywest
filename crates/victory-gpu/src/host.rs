@@ -536,18 +536,7 @@ fn create() -> windows::core::Result<Host> {
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             }
         }
-        let mut device: Option<ID3D12Device> = None;
-        // Diagnostics: the software adapter, on which a shader's wild access
-        // is an access violation in this process (a crash report with the
-        // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
-            let adapter = warp_adapter()?;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-            tracing::info!("host device on the software adapter (WARP)");
-        } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-        }
-        let device = device.ok_or_else(windows::core::Error::empty)?;
+        let device = select_device()?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
         // driver compiling shaders again on the "D3D Background Thread"s,
         // for minutes after pipelines were made or loaded) is switched off.
@@ -621,6 +610,130 @@ fn create() -> windows::core::Result<Host> {
             adapter,
         })
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AdapterMode {
+    Auto,
+    Hardware,
+    Warp,
+}
+
+impl AdapterMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "hardware" => Some(Self::Hardware),
+            "warp" => Some(Self::Warp),
+            _ => None,
+        }
+    }
+}
+
+/// Prefer a hardware adapter that can execute the translated world's mesh
+/// shaders. Modern WARP supplies those features in software on older GPUs.
+/// Both the explicit choice and the fallback work in release builds too.
+fn select_device() -> windows::core::Result<ID3D12Device> {
+    let mode = match std::env::var("VICTORY_D3D12_ADAPTER") {
+        Ok(value) => AdapterMode::parse(&value).ok_or_else(|| {
+            windows::core::Error::new(
+                windows::Win32::Foundation::E_INVALIDARG,
+                "VICTORY_D3D12_ADAPTER must be auto, hardware, or warp",
+            )
+        })?,
+        Err(_) if std::env::var_os("VICTORY_D3D12_WARP").is_some() => AdapterMode::Warp,
+        Err(_) => AdapterMode::Auto,
+    };
+    let make = |adapter: Option<&IDXGIAdapter>| {
+        let mut device: Option<ID3D12Device> = None;
+        let adapter = adapter.map(|a| a.cast::<windows::core::IUnknown>()).transpose()?;
+        // SAFETY: the adapter stays alive through creation; the device owns
+        // its reference afterwards. None selects the system default.
+        unsafe { D3D12CreateDevice(adapter.as_ref(), D3D_FEATURE_LEVEL_12_0, &mut device)? };
+        device.ok_or_else(windows::core::Error::empty)
+    };
+    if mode == AdapterMode::Hardware {
+        tracing::info!("host adapter forced to the system default (hardware mode)");
+        return make(None);
+    }
+    if mode == AdapterMode::Auto {
+        // SAFETY: plain DXGI enumeration and D3D12 feature queries.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let preferred = factory.cast::<IDXGIFactory6>().ok();
+            for index in 0.. {
+                let adapter = match &preferred {
+                    Some(factory) => factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                        index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                    ),
+                    None => factory.EnumAdapters1(index),
+                };
+                let Ok(adapter) = adapter else { break };
+                let desc = adapter.GetDesc1()?;
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                    continue;
+                }
+                let raw: IDXGIAdapter = adapter.cast()?;
+                let Ok(device) = make(Some(&raw)) else { continue };
+                let mesh = supports_mesh_shaders(&device);
+                let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+                tracing::info!(adapter = %String::from_utf16_lossy(&desc.Description[..end]), mesh, "host adapter probed");
+                if mesh {
+                    return Ok(device);
+                }
+            }
+            tracing::warn!("no hardware adapter supports mesh shaders at SM 6.6; using WARP CPU rendering (slower)");
+        }
+    }
+    let adapter = warp_adapter()?;
+    let device = make(Some(&adapter))?;
+    if !supports_mesh_shaders(&device) {
+        return Err(windows::core::Error::new(
+            DXGI_ERROR_UNSUPPORTED,
+            "WARP lacks mesh shaders at SM 6.6; a newer WARP runtime or a compatible hardware adapter is required",
+        ));
+    }
+    if !supports_console_waves(&device) {
+        return Err(windows::core::Error::new(
+            DXGI_ERROR_UNSUPPORTED,
+            "WARP lacks the required 32/64-lane waves; place a current Microsoft.Direct3D.WARP x64 d3d10warp.dll beside victory.exe",
+        ));
+    }
+    tracing::info!("host device on the software adapter (WARP CPU rendering, mesh shaders supported)");
+    Ok(device)
+}
+
+fn supports_mesh_shaders(device: &ID3D12Device) -> bool {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+    let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+        HighestShaderModel: D3D_SHADER_MODEL_6_6,
+    };
+    // SAFETY: each query writes its own structure of the given size.
+    let ok = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS7,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        ).is_ok() && device.CheckFeatureSupport(
+            D3D12_FEATURE_SHADER_MODEL,
+            (&raw mut model).cast(),
+            size_of_val(&model) as u32,
+        ).is_ok()
+    };
+    ok && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
+        && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0
+}
+
+fn supports_console_waves(device: &ID3D12Device) -> bool {
+    let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: the query writes the options structure of the supplied size.
+    (unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut waves).cast(),
+            size_of_val(&waves) as u32,
+        ).is_ok()
+    }) && waves.WaveOps.as_bool() && waves.WaveLaneCountMin <= 32 && waves.WaveLaneCountMax >= 64
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
@@ -2732,31 +2845,7 @@ impl Host {
     pub(crate) fn mesh_shaders(&self) -> bool {
         static MESH: OnceLock<bool> = OnceLock::new();
         *MESH.get_or_init(|| {
-            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
-            let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
-                HighestShaderModel: D3D_SHADER_MODEL_6_6,
-            };
-            // SAFETY: each query writes its own structure of the given size.
-            let ok = unsafe {
-                self.device
-                    .CheckFeatureSupport(
-                        D3D12_FEATURE_D3D12_OPTIONS7,
-                        (&raw mut options).cast(),
-                        size_of_val(&options) as u32,
-                    )
-                    .is_ok()
-                    && self
-                        .device
-                        .CheckFeatureSupport(
-                            D3D12_FEATURE_SHADER_MODEL,
-                            (&raw mut model).cast(),
-                            size_of_val(&model) as u32,
-                        )
-                        .is_ok()
-            };
-            let mesh = ok
-                && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
-                && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
+            let mesh = supports_mesh_shaders(&self.device);
             tracing::info!(mesh, "host mesh shader support");
             mesh
         })

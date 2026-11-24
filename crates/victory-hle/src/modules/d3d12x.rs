@@ -9,6 +9,9 @@ use victory_gpu::object::{HRESULT, Iid, Object};
 
 use crate::{HleExport, HleModule};
 
+#[cfg(windows)]
+pub use victory_gpu::prepare_host;
+
 /// Device creation; first hands the device the title's general allocator
 /// (`XMemAlloc`, which honours the title's hooks) for resource memory.
 extern "system" fn create_device(

@@ -855,9 +855,9 @@ mod tests {
         [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
         void main(out vertices V v[3], out indices uint3 t[1]) {
             SetMeshOutputCounts(3, 1);
-            v[0].p = float4(0, 0, 0, 1);
-            v[1].p = float4(1, 0, 0, 1);
-            v[2].p = float4(0, 1, 0, 1);
+            v[0].p = float4(-1, -1, 0, 1);
+            v[1].p = float4(3, -1, 0, 1);
+            v[2].p = float4(-1, 3, 0, 1);
             t[0] = uint3(0, 1, 2);
         }";
     const PS: &str = "float4 main() : SV_Target { return 1; }";
@@ -927,5 +927,166 @@ mod tests {
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
         );
+    }
+
+    /// Exercise dispatch and rasterization as well as PSO creation. This
+    /// runs on the selected adapter, including the automatic WARP fallback.
+    #[test]
+    fn a_mesh_dispatch_renders_pixels_on_the_selected_adapter() {
+        use windows::core::Interface;
+        let Some(host) = host() else { return };
+        if !host.mesh_shaders() { return; }
+        let Some(dxc) = dxc() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
+        let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
+        let (root, _) = root_signature(&host.device, &[], &[], false).unwrap();
+        let mut state = GraphicsState::default();
+        state.depth.DepthEnable = false.into();
+        state.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        state.targets.NumRenderTargets = 1;
+        state.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let pipeline = mesh_pipeline(
+            &host.device, &root, code(&ms), code(&ps), &state, "mesh pixel readback test",
+        ).unwrap();
+        let mut target: Option<ID3D12Resource> = None;
+        // SAFETY: valid descriptions; resources and PSO outlive execution.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: 4, Height: 4, DepthOrArraySize: 1, MipLevels: 1,
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_RENDER_TARGET, None, &mut target,
+            ).unwrap();
+        }
+        let target = target.unwrap();
+        let readback = host.read_back_buffer(1024).unwrap();
+        let rtv = host.rtv(Some(&target), None);
+        let list = host.new_list().unwrap();
+        // SAFETY: the list is open and every referenced object stays live
+        // through execute, which waits for the queue to finish.
+        unsafe {
+            list.list.SetPipelineState(&pipeline);
+            list.list.SetGraphicsRootSignature(&root);
+            list.list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.list.ClearRenderTargetView(rtv, &[0.0; 4], None);
+            list.list.RSSetViewports(&[D3D12_VIEWPORT {
+                Width: 4.0, Height: 4.0, MaxDepth: 1.0, ..Default::default()
+            }]);
+            list.list.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
+                right: 4, bottom: 4, ..Default::default()
+            }]);
+            list.list.cast::<ID3D12GraphicsCommandList6>().unwrap().DispatchMesh(1, 1, 1);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &target, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            let source = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&target),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                ..Default::default()
+            };
+            let destination = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&readback),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            Width: 4, Height: 4, Depth: 1, RowPitch: 256,
+                        },
+                        ..Default::default()
+                    },
+                },
+            };
+            list.list.CopyTextureRegion(&destination, 0, 0, 0, &source, None);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: execution finished and the mapped buffer holds 1024 bytes.
+        unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let bytes = std::slice::from_raw_parts(mapped.cast::<u8>(), 1024);
+            for row in 0..4 {
+                assert!(bytes[row * 256..row * 256 + 16].iter().all(|&v| v == 255),
+                    "mesh rasterization left row {row} black or incomplete");
+            }
+            readback.Unmap(0, None);
+        }
+    }
+
+    /// Software runtimes differ in their supported wave sizes. Verify the
+    /// execution of both console-sized waves used by translated compute,
+    /// including the WaveSize annotation and actual shader results.
+    #[test]
+    fn the_software_adapter_executes_console_sized_waves() {
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, IDXGIAdapter1, IDXGIFactory4, DXGI_CREATE_FACTORY_FLAGS};
+        let Some(host) = host() else { return };
+        // SAFETY: queries on the selected device and its adapter.
+        let software = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(host.device.GetAdapterLuid()).unwrap();
+            adapter.GetDesc1().unwrap().Flags & 2 != 0
+        };
+        if !software { return; }
+        let Some(dxc) = dxc() else { return };
+        let params = [D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: 0, RegisterSpace: 1,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        }];
+        let (root, _) = root_signature(&host.device, &params, &[], true).unwrap();
+        for lanes in [32, 64] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = format!(
+                "RWByteAddressBuffer output : register(u0, space1);\n\
+                 [WaveSize({lanes})] [numthreads(64, 1, 1)]\n\
+                 void main(uint i : SV_GroupIndex) {{ output.Store(4*i, WaveGetLaneCount()); }}"
+            );
+            let shader = compile(&dxc, dir.path(), &source, "cs_6_6");
+            // SAFETY: the description borrows live shader and root data.
+            let pipeline: ID3D12PipelineState = unsafe {
+                host.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: code(&shader), ..Default::default()
+                }).expect("software renderer must support console-sized waves")
+            };
+            let output = host.uav_buffer(256).unwrap();
+            let readback = host.read_back_buffer(256).unwrap();
+            let list = host.new_list().unwrap();
+            // SAFETY: open list; buffers and pipeline live through execute.
+            unsafe {
+                list.list.SetPipelineState(&pipeline);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootUnorderedAccessView(0, output.GetGPUVirtualAddress());
+                list.list.Dispatch(1, 1, 1);
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                list.list.CopyResource(&readback, &output);
+            }
+            list.close();
+            host.execute(&[&list]);
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: execution finished; readback holds 64 dwords.
+            unsafe {
+                readback.Map(0, None, Some(&mut mapped)).unwrap();
+                let actual = std::slice::from_raw_parts(mapped.cast::<u32>(), 64);
+                assert!(actual.iter().all(|&n| n == lanes), "required {lanes} lanes, got {actual:?}");
+                readback.Unmap(0, None);
+            }
+        }
     }
 }
