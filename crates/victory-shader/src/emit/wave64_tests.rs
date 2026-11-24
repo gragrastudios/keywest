@@ -14,6 +14,78 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
+/// Read the address of a buffer selected at run time, without accessing
+/// that buffer through a descriptor. Both dwords must survive, including
+/// addresses above 4 GiB and slots whose address has been cleared.
+#[test]
+fn dynamically_selected_buffer_addresses_come_from_heap_metadata() {
+    let words = [
+        0x8F00_8500, // s_lshl_b32 s0, s0, 5
+        0xF408_0302, 0x0000_0000, // s_load_dwordx4 s[12:15], s[4:5], s0
+        0x7E00_020C, // v_mov_b32 v0, s12
+        0x7E02_020D, // v_mov_b32 v1, s13
+        0x38 << 26 | 0x1D << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dwordx2 v[0:1], off, s[8:11], 0
+    ];
+    let native = native_of(&words, false, 32);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("dynamic address lowering");
+    assert!(shader.root_srvs.contains(&super::SLOT_STRIDES));
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
+    let param = 1 + shader.root_cbvs.len() as u32
+        + shader.root_srvs.iter().position(|&s| s == super::SLOT_STRIDES).unwrap() as u32;
+    let mut metadata = vec![0; super::SLOT_METADATA_DWORDS as usize];
+    let start = super::SLOT_VIEW_ADDRESSES as usize / 4;
+    metadata[start + 2..start + 6].copy_from_slice(&[0x1234_5600, 0x1B, 0xFEDC_BA00, 0x12]);
+    for (slot, expected) in [(1, [0x1234_5600, 0x1B]), (2, [0xFEDC_BA00, 0x12]), (3, [0, 0])] {
+        let mut ud = vec![0; shader.user_data_dwords() as usize];
+        for word in &shader.user_data {
+            if word.root == RootType::Constants && word.dword == 0 {
+                ud[word.index as usize] = slot;
+            }
+        }
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(ud)), (param, Root::View { srv: true, data: metadata.clone() })],
+            views: &[View::RawUav(2)],
+            samplers: &[], groups: [1, 1, 1],
+        }).expect("dispatch");
+        assert_eq!(out[0], expected, "slot {slot}");
+    }
+}
+
+#[test]
+fn a_complement_mask_in_a_full_wave_keeps_bits_outside_exec() {
+    let words = [
+        0x7D88_0000, // v_cmp_gt_u32 vcc_lo, s0, v0
+        0xBE8E_3C6A, // s_and_saveexec_b32 s14, vcc_lo
+        0xBE8C_077E, // s_not_b32 s12, exec_lo
+        0xBEFE_030E, // s_mov_b32 exec_lo, s14
+        0x7E00_020C, // v_mov_b32 v0, s12
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    let native = native_of(&words, false, 32);
+    let p = ir::build(&native.code, false, native.vgprs).expect("IR");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("full wave mask");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (below, expected) in [(0, u32::MAX), (1, !1), (10, !0x3FF), (32, 0)] {
+        let Some(got) = on_the_card(&shader, [below, 0]) else { return };
+        assert_eq!(got, expected, "{below} lanes in the original mask");
+    }
+    let partial = native_of(&words, false, 16);
+    let p = ir::build(&partial.code, false, partial.vgprs).expect("IR");
+    assert!(matches!(lowered(&partial, &p, &HashSet::new()),
+        Err(ShaderError::Unsupported { what: lower::MASK_ELSEWHERE, .. })));
+}
+
 /// 64 threads in one console wave. Each thread t holds the bit `1 << (t >> 1)`; the threads
 /// below s0 (a root constant) OR theirs over the wave inside `if (t < s0) { ... }` and store
 /// the result to dword 0 of the raw UAV.

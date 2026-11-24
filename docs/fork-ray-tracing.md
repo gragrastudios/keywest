@@ -50,8 +50,9 @@ shaders and emulates the one instruction.
    of the instruction. A plain Rust reference lives in
    `crates/victory-shader/src/bvh.rs`; tests run the emitted DXIL on the GPU
    over 311 ray/node cases and compare with the reference bit for bit.
-4. **The trace and shading programs translate** (59 of 64 trace programs, and
-   the irradiance-cache shading program). This needed lane masks treated as
+4. **The trace and shading programs translate** (including the five formerly
+   missing shadow-mask variants, and the irradiance-cache shading program).
+   This needed lane masks treated as
    plain numbers on some paths, and exact forms for programs written for
    64-lane waves running on a GPU with 32-lane waves.
 5. **A safety rule on the host side.** The builder's stages run only while
@@ -66,7 +67,13 @@ shaders and emulates the one instruction.
 - With `VICTORY_BVH_BUILDER=1` the builder still stays off in a real run: a few
   of its pipelines are refused by the host (they still ask for 64-lane waves on
   a 32-lane GPU) or do not translate.
-- Five shadow-mask trace programs do not translate yet.
+- The five shadow-mask trace programs that previously stopped at dynamically
+  indexed buffer descriptors now translate and pass DXIL validation. Their
+  buffer addresses are read from the host's heap metadata; full wave32 masks
+  can also be read as data without introducing group barriers. All nine
+  `shadowmask:CS_TraceShadowRays` variants create pipelines on the test host
+  when translated for 32-lane waves. This is an offline compiler/pipeline
+  check, not verification of lighting in the game.
 - An access to a title page that has no host copy is lost (a read gives zero, a
   store is dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order

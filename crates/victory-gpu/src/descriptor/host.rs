@@ -52,7 +52,8 @@ pub(crate) struct HostHeap {
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
-    /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
+    /// `SLOT_METADATA_DWORDS` dwords (strides then title-address pairs),
+    /// its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
@@ -608,14 +609,14 @@ impl HostHeap {
         ));
         let strides = (!sampler)
             .then(|| {
-                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
+                let bytes = u64::from(victory_shader::emit::SLOT_METADATA_DWORDS) * 4;
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
                     std::ptr::write_bytes(data, 0, bytes as usize);
                     buffer.GetGPUVirtualAddress()
                 };
-                crate::host::name(&buffer, || "element strides by view heap slot".to_owned());
+                crate::host::name(&buffer, || "buffer strides and title addresses by view heap slot".to_owned());
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
@@ -1042,6 +1043,14 @@ impl HostHeap {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+            let address = view.and_then(buffer_address).unwrap_or(0);
+            let at = victory_shader::emit::SLOT_STRIDES_COUNT as usize + index as usize * 2;
+            // SAFETY: each slot's pair lies inside the metadata mapping.
+            // As with the stride, the heap must not be rewritten while in use.
+            unsafe {
+                (*data as *mut u32).add(at).write_volatile(address as u32);
+                (*data as *mut u32).add(at + 1).write_volatile((address >> 32) as u32);
+            }
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
@@ -1392,6 +1401,23 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
     }
+}
+
+/// The title address encoded in a buffer or acceleration-structure view.
+/// Acceleration structures have no resource object; their SRV union holds
+/// the address directly, rather than a Buffer member.
+pub(crate) fn buffer_address(view: &View) -> Option<u64> {
+    let words = match view {
+        View::Shader(_, Some(d)) => Some(d),
+        View::Placed(false, _, d) => d[..10].try_into().ok(),
+        _ => None,
+    };
+    if let Some(words) = words
+        && words[1] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32
+    {
+        return Some(u64::from(words[4]) | u64::from(words[5]) << 32);
+    }
+    buffer_range(view).map(|r| r.0)
 }
 
 /// The title memory a buffer shader or unordered access view reads: its
@@ -2212,6 +2238,36 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heap_metadata_updates_and_clears_buffer_addresses() {
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        let Some((_, _, data)) = heap.strides else { panic!("heap metadata allocation") };
+        let mut resource = [0; 14];
+        resource[0] = 1;
+        let mut desc = [0; 16];
+        (desc[1], desc[4], desc[6], desc[7]) = (1, 3, 16, 16);
+        (desc[10], desc[11]) = (0x1234_0000, 0x1B);
+        let view = View::Placed(false, resource, desc);
+        assert_eq!(buffer_address(&view), Some(0x1B_1234_0030));
+        heap.note_buffer(1, Some(&view), false);
+        let read = |at: usize| {
+            // SAFETY: this test owns the heap and reads within its mapping.
+            unsafe { (data as *const u32).add(at).read_volatile() }
+        };
+        let pair = victory_shader::emit::SLOT_STRIDES_COUNT as usize + 2;
+        assert_eq!((read(1), read(pair), read(pair + 1)), (16, 0x1234_0030, 0x1B));
+        heap.note_buffer(1, None, false);
+        assert_eq!((read(1), read(pair), read(pair + 1)), (0, 0, 0));
+    }
+
+    #[test]
+    fn acceleration_structure_addresses_do_not_need_a_resource_object() {
+        let mut desc = [0; 10];
+        desc[1] = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
+        (desc[4], desc[5]) = (0xABCD_1200, 0x12);
+        assert_eq!(buffer_address(&View::Shader(0, Some(desc))), Some(0x12_ABCD_1200));
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.

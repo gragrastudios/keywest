@@ -24,8 +24,14 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// root SRV also tells the host that the buffer views of the whole heap
 /// must be ready when it runs, not only those its tables name.
 pub const SLOT_STRIDES: u8 = 255;
-/// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
+/// Slots in each region of the [`SLOT_STRIDES`] metadata buffer:
+/// heap indices are clamped to this count.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// Byte offset of the title-address pairs after the stride dwords in the
+/// same root SRV. Pair `i` is the low/high address of buffer view slot `i`.
+pub const SLOT_VIEW_ADDRESSES: u32 = SLOT_STRIDES_COUNT * 4;
+/// Dwords in the heap metadata buffer: strides followed by address pairs.
+pub const SLOT_METADATA_DWORDS: u32 = SLOT_STRIDES_COUNT * 3;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,

@@ -2573,14 +2573,39 @@ impl<'a> Lower<'a> {
 
     /// The title address (low dword, bits from 32 up) of the buffer view
     /// whose descriptor the scalar load at `site` reads from the start of
-    /// a table entry, as the host tells it when it binds (`shader.rs`
-    /// `USER_VIEW_ADDRESS`); none for anything else. (The console's
+    /// a fixed table entry, as the host tells it when it binds (`shader.rs`
+    /// `USER_VIEW_ADDRESS`), or from the heap metadata for a dynamically
+    /// selected buffer descriptor; none for anything else. (The console's
     /// descriptor holds more in the second dword, the stride from bit 16
     /// up; code that takes the address masks those away.)
     fn view_address(&mut self, site: Site) -> Option<(V, V)> {
         use super::shader::USER_VIEW_ADDRESS;
         let a = self.scalar.get(&site).copied()?;
         let rp = *self.x.native.layout.get(a.param)?;
+        if matches!(rp.root, RootType::ResourceHeap | RootType::Table)
+            && (rp.root == RootType::ResourceHeap || a.dynamic.is_some())
+            && self.x.p.blocks[site.0].insts[site.1].name() == "s_load_dwordx4"
+        {
+            // A buffer descriptor selected at run time: its title address is
+            // kept beside the strides, indexed exactly as the view heap is.
+            let c = self.cur;
+            let slot = self.heap_index(site, 0, false).ok()?;
+            let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
+            let i32t = self.s.t.i32;
+            let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+            self.s.m.tag(slot, Tag::Clamp);
+            let three = self.s.m.i32(3);
+            let byte = self.s.m.bin(c, Bin::Shl, slot, three);
+            let base = self.s.m.i32(super::shader::SLOT_VIEW_ADDRESSES);
+            let byte = self.s.m.bin(c, Bin::Add, base, byte);
+            let h = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
+            let (iu, mask, align) = (self.s.m.undef(i32t), self.s.m.i8(3), self.s.m.i32(4));
+            let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret,
+                139, &[h, byte, iu, mask, align]);
+            let lo = self.s.m.extract(c, r, 0);
+            let hi = self.s.m.extract(c, r, 1);
+            return Some((self.as_int(lo), self.as_int(hi)));
+        }
         if rp.root != RootType::Table || a.dynamic.is_some() || a.offset % 32 != 0 {
             return None;
         }
@@ -2953,9 +2978,15 @@ impl<'a> Lower<'a> {
         // say) is the ballot of the lanes that are there: all of them, where two exchanging
         // host waves know every lane runs that block.
         let made = self.def_block.get(&lo).copied();
-        let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
+        // A full console wave32 also has every bit available to a ballot:
+        // it needs no exchange and no group barrier. Keep partial waves
+        // conservative, since missing host lanes cannot vote.
+        let full_host_wave = !self.x.native.wave64
+            && matches!(self.x.native.io, StageIo::Cs(cs) if cs.threads.iter().product::<u32>().is_multiple_of(32));
+        let whole = (self.exchange.is_some() || full_host_wave)
+            && !self.local && made.is_none_or(|b| self.all_lanes(b));
         if !self.x.st.active.contains(&lo) && !whole {
-            if self.exchange.is_some() && !self.local {
+            if (self.exchange.is_some() || full_host_wave) && !self.local {
                 need(made.unwrap_or(0));
             }
             return Err(MASK_ELSEWHERE);

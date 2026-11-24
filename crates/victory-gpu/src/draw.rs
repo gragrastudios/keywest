@@ -703,8 +703,8 @@ impl State {
         // The title address of the buffer view at that dword of the table.
         let address = match self.roots_ref(compute).get(usize::from(slot)) {
             Some(&Root::Table(table)) => crate::descriptor::view(table + u64::from(dword) * 4)
-                .and_then(|view| crate::descriptor::host::buffer_range(&view))
-                .map_or(0, |range| range.0),
+                .and_then(|view| crate::descriptor::host::buffer_address(&view))
+                .unwrap_or(0),
             _ => 0,
         };
         if address == 0 {

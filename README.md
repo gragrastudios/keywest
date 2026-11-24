@@ -46,9 +46,13 @@ Rendering:
 - Light packed by the game's compute shaders was read back through empty copies (sky, probes, fog); fixed for every mip level and layer.
 - The fog reconstruction, shadow-mask, hair, blend-shape skinning, fire and several material programs did not translate; fixed.
 - Gathers at a named mip level (with and without an offset) read level 0; fixed.
+- The five remaining shadow-mask trace programs failed to translate when
+  reading dynamically selected buffer addresses or full wave32 masks; fixed.
+  All nine shadow-mask trace variants validate and create host pipelines
+  when translated for 32-lane waves; in-game ray-traced lighting remains unverified.
 - Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
 - Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
-- Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. Nothing is lit by it yet. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
+- Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and the trace programs translate, including the five previously missing shadow-mask variants. Nothing is lit by it yet. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
 
 Speed and memory:
 - Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
