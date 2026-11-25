@@ -47,6 +47,11 @@ Without that DLL the automatic profile selects Series X. `-VramGB 8` or `12` red
 buffer and staging budgets. Command-list retention is capped below Neptune's original
 64 GB RAM profile. `-AutoAdvance` optionally taps A through the startup screens.
 
+Transient window uploads are disabled in the launcher. Live world-entry logs showed
+shader writes reaching these windows, which have no CPU copy to merge writes back
+into. The regular window path retains that copy. This removes the unsafe profile
+setting; it does not establish that all geometry or shading defects are resolved.
+
 The performance switches are opt-in through the launcher. Frame generation is not
 configured. The frame-time CSV goes to the configured cache folder as `frametime.csv`.
 Compare the same scene, console profile, and warmed shader cache when measuring changes.
@@ -65,7 +70,10 @@ Warm-up on the target NVIDIA wave32 GPU translated 25,758 shaders and created 2,
 compute pipelines with zero refusals. This proves translation and pipeline creation;
 it does not prove correct rendering of every scene.
 
-Live startup was attempted with the regular and reduced budgets. The test monitor
-stopped both attempts before the first frame when remaining Windows commit fell below
-its safety margin. World rendering and FPS remain unverified pending more memory
-headroom; no measured performance improvement is claimed for this integration yet.
+The user subsequently reached the world and reported broken shading and geometry,
+followed by upload-buffer and Rust allocation failures. Monitored reproductions
+confirmed commit exhaustion during loading/world entry. A separate experiment with
+a 3 GiB texture preload cap delayed exhaustion but still required the monitor to stop
+the process; that cap is not enabled by the launcher. Live logs also exposed the
+transient-window write loss addressed above. A stable world run and the visual effect
+of that correction remain unverified; no measured performance improvement is claimed.
