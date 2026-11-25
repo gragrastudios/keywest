@@ -2,7 +2,7 @@
 # GPL-3.0-or-later. See docs/neptune-integration.md for provenance and limits.
 [CmdletBinding()]
 param(
-    [string]$Game = (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'GTA6\GTA6.Xbox.v1.0.2.1-CYBERLEEK\game_scarlett_master.exe'),
+    [string]$Game,
     [string]$Runtime = (Join-Path $PSScriptRoot '..\target\release\victory.exe'),
     [ValidateSet('auto', 'series-s', 'series-x')][string]$Console = 'auto',
     [string]$FsrDll,
@@ -13,12 +13,18 @@ param(
     [switch]$DryRun
 )
 $ErrorActionPreference = 'Stop'
+if (-not $Game) {
+    $gameRoot = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'GTA6'
+    $candidates = @(Get-ChildItem -LiteralPath $gameRoot -Filter 'game_scarlett_master.exe' -File -Recurse -Depth 2 -ErrorAction SilentlyContinue)
+    if ($candidates.Count -gt 1) { throw 'More than one game installation found. Pass -Game with the executable to use.' }
+    $Game = if ($candidates.Count -eq 1) { $candidates[0].FullName } else { Join-Path $gameRoot 'game_scarlett_master.exe' }
+}
 if (-not $FsrDll -and $Console -ne 'series-x') {
     $cachedDll = Join-Path $env:LOCALAPPDATA 'victory\dependencies\fidelityfx\amd_fidelityfx_upscaler_dx12.dll'
     if (Test-Path -LiteralPath $cachedDll -PathType Leaf) { $FsrDll = $cachedDll }
 }
 if (-not $DryRun) {
-    if (-not (Test-Path -LiteralPath $Game -PathType Leaf)) { throw "Game executable not found: $Game. Finish copying the game before launching." }
+    if (-not (Test-Path -LiteralPath $Game -PathType Leaf)) { throw "Game executable not found: $Game. Pass -Game with its full path." }
     if (-not (Test-Path -LiteralPath $Runtime -PathType Leaf)) { throw "Runtime not found: $Runtime. Build with: cargo build --release -p victory" }
 }
 if ($FsrDll -and -not (Test-Path -LiteralPath $FsrDll -PathType Leaf)) { throw "FidelityFX DLL not found: $FsrDll" }

@@ -33,7 +33,7 @@ Build with `cargo build --release -p victory`, then:
 .\tools\start-keywest.ps1 -Game 'C:\path\to\game_scarlett_master.exe' -FrametimeDump
 ```
 
-The launcher defaults to the game's new Documents location. `-DryRun` prints the
+The launcher finds a unique executable under `Documents\GTA6`. `-DryRun` prints the
 configuration without opening game files or starting the runtime.
 For Series S's lower rendering resolution, supply your own PC upscaler:
 
@@ -55,6 +55,17 @@ reading every unrelated game archive.
 
 ## Validation
 
-Source builds and synthetic tests can run without the game. Live startup, world rendering,
-and FPS must be checked after the user's game-directory move finishes. No improvement
-on the user's machine is claimed until those measurements are available.
+The combined source passes both strict Clippy configurations, the default workspace
+tests (615 passed), and the diagnostics workspace tests (629 passed), with 10 tests
+intentionally ignored in each run. GPU tests exercise the display overlay, descriptor
+metadata, buffer patches, and copy-back paths. The remapping test now waits for its
+reader thread to start, avoiding a scheduling-dependent false failure under CPU load.
+
+Warm-up on the target NVIDIA wave32 GPU translated 25,758 shaders and created 2,734
+compute pipelines with zero refusals. This proves translation and pipeline creation;
+it does not prove correct rendering of every scene.
+
+Live startup was attempted with the regular and reduced budgets. The test monitor
+stopped both attempts before the first frame when remaining Windows commit fell below
+its safety margin. World rendering and FPS remain unverified pending more memory
+headroom; no measured performance improvement is claimed for this integration yet.

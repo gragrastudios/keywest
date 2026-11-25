@@ -1657,6 +1657,7 @@ mod tests {
         unsafe { a.cast::<u8>().write(1) };
         let first = a as usize;
         let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (started, ready) = std::sync::mpsc::sync_channel(0);
         let reader = {
             let stop = stop.clone();
             std::thread::spawn(move || {
@@ -1668,10 +1669,16 @@ mod tests {
                     // is held.
                     assert_eq!(unsafe { (first as *const u8).read_volatile() }, 1);
                     reads += 1;
+                    drop(_reading);
+                    if reads == 1 {
+                        started.send(()).expect("the remapper is waiting");
+                    }
                 }
                 reads
             })
         };
+        // Do not let the remapper finish before the reader is even scheduled.
+        ready.recv().expect("the reader started successfully");
         for _ in 0..2000 {
             // The same pages at the same address: the view goes and comes
             // back, with the same bytes.
