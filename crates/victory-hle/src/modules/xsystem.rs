@@ -168,6 +168,22 @@ mod device_type {
         }
     }
 
+    /// The value the title reads. `VICTORY_RENDER_S=1`: a Series S's on any
+    /// console. The title picks its render path by this value alone (a
+    /// 1920x1080 game plane under a 3840x2160 UI plane) and its content and
+    /// memory by the rest of the profile, so a Series X install renders a
+    /// quarter of the pixels (measured on Neptune's other runtime: the
+    /// registry value and the analytics form are all the title asks).
+    fn reported_mode() -> u32 {
+        static RENDER_S: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("VICTORY_RENDER_S").is_some_and(|v| v != "0"));
+        if *RENDER_S {
+            console_mode(Console::SeriesS)
+        } else {
+            console_mode(console::current())
+        }
+    }
+
     fn is(text: *const u16, expected: &str) -> bool {
         if text.is_null() {
             return false;
@@ -253,8 +269,7 @@ mod device_type {
             if room < 4 {
                 return MORE_DATA;
             }
-            data.cast::<u32>()
-                .write_unaligned(console_mode(console::current()));
+            data.cast::<u32>().write_unaligned(reported_mode());
         }
         tracing::debug!(console = console::current().name(), "device type read");
         SUCCESS

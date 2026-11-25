@@ -150,6 +150,10 @@ impl Memory {
         // SAFETY: a live buffer.
         let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+            // (Neptune) A rebar window has none: refused for unordered access.
+            if shadow.is_rebar() {
+                crate::shadow::REBAR[7].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             return;
         }
         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {

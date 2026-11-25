@@ -29,7 +29,16 @@ struct Fence {
     value: AtomicU64,
     flags: u32,
     /// Events to set once the value reaches theirs (handles as integers).
-    waiters: Mutex<Vec<(u64, usize)>>,
+    waiters: Mutex<Vec<(u64, usize, std::time::Instant)>>,
+}
+
+/// (Neptune) Since they were last taken: events asked for a value the fence had reached
+/// already, events asked for one it had not, and the microseconds those then waited to be set.
+static ASKED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// [`ASKED`], taken.
+pub(crate) fn asked_taken() -> [u64; 3] {
+    std::array::from_fn(|i| ASKED[i].swap(0, Ordering::Relaxed))
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -85,6 +94,7 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         if !event.is_null() {
             set_event(event as usize);
         }
+        ASKED[0].fetch_add(1, Ordering::Relaxed);
         return S_OK;
     }
     if event.is_null() {
@@ -106,7 +116,8 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         tracing::warn!(value, "blocking fence wait not implemented");
         return E_NOTIMPL;
     }
-    waiters.push((value, event as usize));
+    ASKED[1].fetch_add(1, Ordering::Relaxed);
+    waiters.push((value, event as usize, std::time::Instant::now()));
     S_OK
 }
 /// Moves the fence to `value` and sets the events that waited for it.
@@ -114,10 +125,11 @@ pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
-    waiters.retain(|&(wanted, event)| {
+    waiters.retain(|&(wanted, event, since)| {
         let reached = wanted <= value;
         if reached {
             set_event(event);
+            ASKED[2].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         !reached
     });

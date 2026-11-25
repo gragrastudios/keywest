@@ -1,6 +1,6 @@
 [package]
 name = "victory"
-description = "Command-line front end: inspect, census, convert, run."
+description = "KeyWest command-line front end: inspect, census, convert, run."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,7 @@ victory-core.workspace = true
 victory-pe.workspace = true
 victory-loader.workspace = true
 victory-hle.workspace = true
+victory-gpu.workspace = true
 victory-shader = { workspace = true, features = ["host"] }
 victory-game.workspace = true
 anyhow.workspace = true
@@ -19,6 +20,7 @@ blake3.workspace = true
 memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
+tracing.workspace = true
 
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,

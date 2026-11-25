@@ -97,6 +97,138 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
     Some(to.min(end))
 }
 
+/// (Neptune) The title waits in loops of MONITORX and MWAITX, which this CPU lacks: every pass
+/// was two exceptions (a fifth of the title's main thread in one sample). The three bytes
+/// become a NOP, or PAUSE and a NOP, the first time each is met: the loop then spins as a PC
+/// one does. Written with the byte behind them in one store, so a thread running into the
+/// instruction meanwhile sees the old one or the new one. `VICTORY_PATCH_WAITS=0`: as before.
+fn patch_wait(rip: usize, len: usize, bytes: [u8; 3]) {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if len != 3 || !*ON.get_or_init(|| std::env::var_os("VICTORY_PATCH_WAITS").is_none_or(|v| v != "0")) {
+        return;
+    }
+    if !readable(rip, 4) {
+        return;
+    }
+    let mut old = 0u32;
+    // SAFETY: four readable bytes of code, made writable for one store and restored; the
+    // fourth byte is written back as it was read.
+    unsafe {
+        if VirtualProtect(rip as *const _, 4, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
+            let behind = *((rip + 3) as *const u8);
+            let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], behind]);
+            std::ptr::write_unaligned(rip as *mut u32, word);
+            VirtualProtect(rip as *const _, 4, old, &mut old);
+            static TOLD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if TOLD.fetch_add(1, Relaxed) < 8 {
+                tracing::info!(at = format_args!("{rip:#x}"), "a wait instruction this CPU lacks: replaced where it stands");
+            }
+        }
+    }
+}
+
+/// (Neptune) Instructions emulated so far by kind: clzero, clzero loops, monitorx/mwaitx,
+/// rdpru, rdpid, extrq, insertq, others.
+static KINDS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// Clzero loops replaced where they stand ([`patch_clzero_loop`]).
+static LOOPS_REPLACED: AtomicU64 = AtomicU64::new(0);
+
+/// Executable memory near the title's code for [`patch_clzero_loop`]: its start, how much
+/// of it is used, its size (0: not made yet; `usize::MAX`: it could not be made).
+static NEAR: std::sync::Mutex<(usize, usize, usize)> = std::sync::Mutex::new((0, 0, 0));
+
+/// (Neptune) The title zeroes memory with `clzero; add rax, 40h; cmp rax, <reg>; jb` loops,
+/// and this CPU has no CLZERO: every run of such a loop was an exception, a trip into Windows
+/// and back and through every handler (8 million in five minutes, some 2,600 a frame, on the
+/// threads that record the frame's draws). The twelve bytes of the loop become a jump to a
+/// few instructions of ours that do what the emulation did: zero `[rax, reg)` if `reg` is
+/// above `rax`, leave `reg` in `rax`, with the flags of the loop's last compare. Other
+/// registers are as they were. `VICTORY_PATCH_CLZERO=0`: emulated every time, as before.
+fn patch_clzero_loop(rip: usize, end_reg: u8) {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualProtect};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PATCH_CLZERO").is_none_or(|v| v != "0")) {
+        return;
+    }
+    let r = end_reg & 15;
+    // Not against rax or rsp (the code below pushes), and the first eight bytes in one
+    // cache line: they are written with one store, so that a thread arriving there
+    // meanwhile runs the old loop or the jump.
+    if r == 0 || r == 4 || rip % 64 > 56 || !readable(rip, 12) {
+        return;
+    }
+    let Ok(mut near) = NEAR.lock() else { return };
+    // SAFETY: twelve readable bytes of code.
+    let now = unsafe { std::slice::from_raw_parts(rip as *const u8, 12) };
+    if now[0] != 0x0F || now[1] != 0x01 || now[2] != 0xFC {
+        // Another thread replaced it already.
+        return;
+    }
+    const SIZE: usize = 64 << 10;
+    if near.2 == 0 {
+        // Within reach of a 32-bit jump from the title's code: tried every 16 MiB, below
+        // and above.
+        let base = rip & !0xFFFF;
+        let mut made = 0usize;
+        'find: for step in 1..=100usize {
+            for at in [base.wrapping_sub(step << 24), base.wrapping_add(step << 24)] {
+                // SAFETY: a reservation of our own, where the address is free.
+                let p = unsafe { VirtualAlloc(at as *const _, SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) } as usize;
+                if p != 0 {
+                    made = p;
+                    break 'find;
+                }
+            }
+        }
+        *near = if made == 0 { (0, 0, usize::MAX) } else { (made, 0, SIZE) };
+    }
+    if near.2 == usize::MAX || near.1 + 48 > near.2 {
+        return;
+    }
+    let at = near.0 + near.1;
+    let back = rip + 12;
+    let rex = 0x48 | u8::from(r >= 8);
+    let mut code: Vec<u8> = vec![
+        0x57,                           // push rdi
+        0x51,                           // push rcx
+        rex, 0x8B, 0xC8 | (r & 7),      // mov rcx, reg (the end)
+        0x48, 0x89, 0xC7,               // mov rdi, rax (the start)
+        0x48, 0x29, 0xF9,               // sub rcx, rdi (the bytes)
+        0x76, 0x04,                     // jbe +4: nothing to zero
+        0x31, 0xC0,                     // xor eax, eax
+        0xF3, 0xAA,                     // rep stosb
+        0x59,                           // pop rcx
+        0x5F,                           // pop rdi
+        rex, 0x8B, 0xC0 | (r & 7),      // mov rax, reg
+        rex, 0x3B, 0xC0 | (r & 7),      // cmp rax, reg
+        0xE9,                           // jmp back
+    ];
+    let from = at + code.len() + 4;
+    let Ok(rel_back) = i32::try_from(back as i64 - from as i64) else { return };
+    code.extend_from_slice(&rel_back.to_le_bytes());
+    let Ok(rel_there) = i32::try_from(at as i64 - (rip as i64 + 5)) else { return };
+    // SAFETY: memory of our own, with room (checked above); nothing runs it yet.
+    unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), at as *mut u8, code.len()) };
+    near.1 += code.len().next_multiple_of(16);
+    let mut old = 0u32;
+    // SAFETY: the loop's own twelve bytes, made writable for the patch and restored. The jump
+    // and the three bytes behind it go in with one store; the rest of the loop is never
+    // reached again (it was only entered through its first instruction).
+    unsafe {
+        if VirtualProtect(rip as *const _, 12, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
+            let rel = rel_there.to_le_bytes();
+            let word = u64::from_le_bytes([0xE9, rel[0], rel[1], rel[2], rel[3], 0xCC, 0xCC, 0xCC]);
+            std::ptr::write_unaligned(rip as *mut u64, word);
+            VirtualProtect(rip as *const _, 12, old, &mut old);
+            let n = LOOPS_REPLACED.fetch_add(1, Relaxed) + 1;
+            if n <= 16 {
+                tracing::info!(at = format_args!("{rip:#x}"), end_reg = r, n, "a clzero loop replaced where it stands");
+            }
+        }
+    }
+}
+
 /// An illegal instruction at `ctx.Rip`: a console-only one is emulated and stepped over
 /// (`CONTINUE_EXECUTION`); anything else returns 0 (the crash report and the title's handlers
 /// see it).
@@ -126,10 +258,30 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     // SAFETY: `n` bytes at `rip` are readable.
     let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
     let Some((what, len)) = decode::decode(code) else { return 0 };
+    // (Neptune) What kind, for the counts in the log, and so that the lock below is only
+    // taken until each kind has been seen once (it was taken for every instruction, by
+    // every thread).
+    let kind = match what {
+        ConsoleOnly::Clzero => 0,
+        ConsoleOnly::ClzeroLoop { .. } => 1,
+        ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx => 2,
+        ConsoleOnly::Rdpru => 3,
+        ConsoleOnly::Rdpid(_) => 4,
+        ConsoleOnly::Extrq { .. } => 5,
+        ConsoleOnly::Insertq { .. } => 6,
+        _ => 7,
+    };
+    KINDS[kind].fetch_add(1, Relaxed);
+    static SEEN_ALL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
-    if let Ok(mut seen) = SEEN.lock()
+    if SEEN_ALL.load(Relaxed) & (1 << kind) == 0
+        && let Ok(mut seen) = SEEN.lock()
         && !seen.contains(&std::mem::discriminant(&what))
     {
+        if kind != 2 && kind != 5 && kind != 6 {
+            // (Kinds of one instruction each: seen for good.)
+            SEEN_ALL.fetch_or(1 << kind, Relaxed);
+        }
         seen.push(std::mem::discriminant(&what));
         if what != ConsoleOnly::Ud2 {
             tracing::warn!(instruction = ?what, at = format_args!("{rip:#x}"), "a console CPU instruction this CPU lacks: emulated (logged once)");
@@ -149,8 +301,11 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 }
             }
         }
-        ConsoleOnly::Monitorx => {}
-        ConsoleOnly::Mwaitx => std::hint::spin_loop(),
+        ConsoleOnly::Monitorx => patch_wait(rip, len, [0x0F, 0x1F, 0x00]),
+        ConsoleOnly::Mwaitx => {
+            std::hint::spin_loop();
+            patch_wait(rip, len, [0xF3, 0x90, 0x90]);
+        }
         ConsoleOnly::Clzero => {
             // with an address-size prefix (0x67) the line is at EAX, zero-extended
             let a32 = code[..len - 3].contains(&0x67);
@@ -191,6 +346,7 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 }
             }
             ctx.Rax = end as u64;
+            patch_clzero_loop(rip, end_reg);
         }
         ConsoleOnly::Rdpru => {
             let mut v = 0i64;
@@ -242,6 +398,14 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             emulated,
             asked = ASKED.load(Relaxed),
             zeroed_mb = ZEROED.load(Relaxed) >> 20,
+            clzero = KINDS[0].load(Relaxed),
+            clzero_loops = KINDS[1].load(Relaxed),
+            waits = KINDS[2].load(Relaxed),
+            rdpru = KINDS[3].load(Relaxed),
+            rdpid = KINDS[4].load(Relaxed),
+            extrq = KINDS[5].load(Relaxed),
+            insertq = KINDS[6].load(Relaxed),
+            loops_replaced = LOOPS_REPLACED.load(Relaxed),
             "console CPU instructions emulated so far, the times Windows was asked about memory for them, and what clzero loops zeroed"
         );
     }

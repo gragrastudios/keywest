@@ -10,7 +10,23 @@ correctly and playably on one particular PC.
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
 
+## Neptune integration (2026-11-25)
+
+KeyWest now incorporates Neptune VE 2026-11-25c's world renderer, NVIDIA
+wave handling, texture streaming, ambient-light fallback, and performance
+tools, while retaining its startup and dynamic buffer-address fixes.
+Build and run instructions, source attribution, and limitations are in
+[docs/neptune-integration.md](docs/neptune-integration.md).
+
+**Live rendering and FPS for this combined build are not yet verified.**
+The figures below describe earlier fork builds. The performance launcher
+is `tools/start-keywest.ps1`; use `-DryRun` to inspect its configuration.
+
 ## Credits
+
+- **Neptune VE 2026-11-25c** and its contributors supplied the integrated
+  renderer and performance changes. Its [original credits and notes](docs/neptune-source-notes.txt)
+  are included, with GPL-3.0-or-later notices preserved in the source.
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors is the base of everything here: the loader, the runtime

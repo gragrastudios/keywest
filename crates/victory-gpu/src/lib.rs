@@ -17,20 +17,29 @@
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
-#[cfg(windows)]
-mod composite;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+pub mod external;
 pub mod fence;
 pub mod frame;
+pub mod frametime;
 #[cfg(windows)]
 mod host;
+#[cfg(windows)]
+mod overlay;
+#[cfg(windows)]
+mod pixels;
+#[cfg(windows)]
+mod screenshot;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
@@ -51,10 +60,20 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod ramline;
+#[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod windowup;
+#[cfg(windows)]
+mod tiles;
 pub mod signature;
 #[cfg(windows)]
+mod texback;
+#[cfg(windows)]
 mod texture;
+#[cfg(windows)]
+pub mod titlemem;
 #[cfg(windows)]
 mod watch;
 
@@ -64,8 +83,11 @@ pub use host::on_failure;
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
+    Remapping, notify_view_writes, title_memory_reading, title_memory_reading_range, title_memory_remapped,
+    title_memory_remapping, title_memory_remapping_range, title_memory_written, writing as kernel_will_write,
+    written_through_view,
 };
+
 
 /// Initializes the host graphics device before title startup timers run.
 #[cfg(windows)]

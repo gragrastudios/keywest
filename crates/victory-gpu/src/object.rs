@@ -50,6 +50,11 @@ pub struct Object {
 unsafe impl Sync for Object {}
 
 impl Object {
+    /// The object's function table.
+    pub(crate) fn table(&self) -> *const *const () {
+        self.functions
+    }
+
     pub(crate) const fn new<const N: usize>(table: &'static Table<N>) -> Self {
         Object {
             functions: table.0.as_ptr(),

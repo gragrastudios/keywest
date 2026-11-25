@@ -79,6 +79,16 @@ pub(crate) extern "system" fn schedule(
     S_OK
 }
 
+/// (Neptune) Frame waits since they were last taken ([`waits_taken`]): counts of waits that
+/// ended on a tick (origin, other) and that timed out (origin, other), the microseconds
+/// slept in each, and the longest time-out asked for (ms).
+static WAITS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
+/// [`WAITS`], taken.
+pub(crate) fn waits_taken() -> [u64; 9] {
+    std::array::from_fn(|i| WAITS[i].swap(0, Ordering::Relaxed))
+}
+
 /// Frames begun so far (frame waits that ended).
 pub(crate) fn current() -> u64 {
     FRAME.load(Ordering::Relaxed)
@@ -142,14 +152,30 @@ pub(crate) extern "system" fn wait(
         tick -= 1;
         wait = Duration::ZERO;
     }
+    // (Neptune) `VICTORY_PACE=0`: no wait sleeps (a poll whose tick is not due times out at
+    // once, a blocking wait ends at once on the next tick): an experiment, to see how much
+    // of a slow frame is the title waiting for its own clock.
+    static PACED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let paced = *PACED.get_or_init(|| std::env::var_os("VICTORY_PACE").is_none_or(|v| v != "0"));
+    let started = Instant::now();
     let hr = if wait > limit {
-        std::thread::sleep(limit);
+        if paced {
+            std::thread::sleep(limit);
+        }
         TIMEOUT
     } else {
-        std::thread::sleep(wait);
+        if paced {
+            std::thread::sleep(wait);
+        }
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK
     };
+    // Since the last line in the log: waits that ended on a tick and waits that timed out,
+    // by kind (origin, other), and the microseconds slept in them.
+    let slot = usize::from(hr != S_OK) * 2 + usize::from(!origin);
+    WAITS[slot].fetch_add(1, Ordering::Relaxed);
+    WAITS[4 + slot].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    WAITS[8].fetch_max(u64::from(timeout_ms.min(100_000)), Ordering::Relaxed);
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         use crate::copystat::{C, add};

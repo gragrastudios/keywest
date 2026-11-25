@@ -30,6 +30,8 @@ enum TypeDef {
     Void,
     Int(u32),
     Float,
+    /// A 64-bit float.
+    Double,
     /// Pointee and address space.
     Ptr(Ty, u32),
     Struct(Option<String>, Vec<Ty>),
@@ -107,6 +109,7 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
+    FpExt = 8,
     Bitcast = 11,
 }
 
@@ -247,6 +250,9 @@ impl Module {
     pub fn float(&mut self) -> Ty {
         self.ty(TypeDef::Float)
     }
+    pub fn double(&mut self) -> Ty {
+        self.ty(TypeDef::Double)
+    }
     pub fn ptr(&mut self, to: Ty) -> Ty {
         self.ty(TypeDef::Ptr(to, 0))
     }
@@ -318,6 +324,15 @@ impl Module {
                 Const::Int(x) => Some(x),
                 _ => None,
             },
+            _ => None,
+        }
+    }
+
+    /// `x` where `v` is the integer negation `0 - x` of a value `x` that is no constant.
+    pub fn negation_of(&self, v: V) -> Option<V> {
+        let V::Inst(i) = v else { return None };
+        match self.insts[i as usize].op {
+            Op::Bin(Bin::Sub, a, x) if self.int_value(a) == Some(0) && !matches!(x, V::Const(_)) => Some(x),
             _ => None,
         }
     }
@@ -578,6 +593,7 @@ impl Module {
             match t {
                 TypeDef::Void => w.record(2, &[]),
                 TypeDef::Float => w.record(3, &[]),
+                TypeDef::Double => w.record(4, &[]),
                 TypeDef::Int(b) => w.record(7, &[u64::from(*b)]),
                 TypeDef::Ptr(p, space) => w.record(8, &[u64::from(p.0), u64::from(*space)]),
                 TypeDef::Array(n, e) => w.record(11, &[u64::from(*n), u64::from(e.0)]),
