@@ -585,13 +585,20 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// Present plane ABI: a frame token, resources, source pixel rectangles,
+/// normalized destination rectangles, and the remaining display settings.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    source_rects: *const [i32; 4],
+    destination_rects: *const [f32; 4],
+    display_settings: [u64; 4],
 }
+const _: () = assert!(size_of::<Plane>() == 72);
+const _: () = assert!(std::mem::offset_of!(Plane, source_rects) == 24);
+const _: () = assert!(std::mem::offset_of!(Plane, destination_rects) == 32);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -750,10 +757,10 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
+/// Composes the display planes in order into our window.
 ///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// shortcut: mono resources and SDR premultiplied alpha; the opaque display
+/// settings (HDR metadata, stereo, and other console output flags) are not applied.
 extern "system" fn present(
     _: This,
     planes: u32,
@@ -816,24 +823,48 @@ extern "system" fn present(
     }
     #[cfg(windows)]
     if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
+        && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
-        const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        // SAFETY: the title supplies `planes` complete plane descriptions.
+        let planes = unsafe { std::slice::from_raw_parts(plane_parameters, planes as usize) };
+        let mut layers = Vec::new();
+        let mut first = None;
+        for plane in planes {
+            if plane.count == 0 || plane.resources.is_null() {
+                continue;
+            }
+            // One resource per plane for mono output. Additional resources are stereo eyes.
+            // SAFETY: the plane supplies `count` resource pointers and optional rectangles.
+            let (resource, source, destination) = unsafe {
+                (
+                    *plane.resources,
+                    plane.source_rects.as_ref().copied(),
+                    plane.destination_rects.as_ref().copied(),
+                )
+            };
+            let Some(texture) = crate::resource::host_resource(resource) else {
+                continue;
+            };
+            const READ: u32 = 0x80;
+            let state =
+                crate::resource::host_transition(resource, READ).map_or(READ, |(_, before)| before);
+            crate::resource::host_transition(resource, state);
+            first.get_or_insert((resource, state));
+            layers.push(crate::composite::Layer {
+                texture: texture.clone(),
+                state,
+                source,
+                destination,
+            });
+        }
+        if let Some((resource, state)) = first {
+            let shown = host.present(&layers, frame);
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, resource, state, shown);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = (resource, state, shown);
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);

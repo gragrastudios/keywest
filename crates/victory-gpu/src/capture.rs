@@ -28,6 +28,18 @@ pub(crate) fn listed(n: u64) -> bool {
                 .collect()
         })
         .contains(&n);
+    // Periodic traces are useful when startup keeps presenting black frames:
+    // the next menu can appear long after a fixed frame list has passed.
+    static EVERY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let periodic = EVERY
+        .get_or_init(|| {
+            std::env::var("VICTORY_CAPTURE_EVERY")
+                .ok()?
+                .parse::<u64>()
+                .ok()
+                .filter(|&n| n > 0)
+        })
+        .is_some_and(|every| n.is_multiple_of(every));
     // `VICTORY_CAPTURE_WORLD`: also the 2nd and the 6th frame after the first
     // one that ran 500 draws or more (a title's first 3D frames: their
     // numbers depend on how long the menus were shown), and the 30th and
@@ -47,7 +59,9 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named
+        || periodic
+        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
