@@ -3,7 +3,7 @@
 [CmdletBinding()]
 param(
     [string]$Game,
-    [string]$Runtime = (Join-Path $PSScriptRoot '..\target\release\victory.exe'),
+    [string]$Runtime,
     [ValidateSet('auto', 'series-s', 'series-x')][string]$Console = 'auto',
     [string]$FsrDll,
     [ValidateSet(8, 12, 16, 24)][int]$VramGB = 16,
@@ -13,6 +13,10 @@ param(
     [switch]$DryRun
 )
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell may evaluate parameter defaults before PSScriptRoot is set.
+if (-not $Runtime) {
+    $Runtime = Join-Path $PSScriptRoot '..\target\release\victory.exe'
+}
 if (-not $Game) {
     $gameRoot = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'GTA6'
     $candidates = @(Get-ChildItem -LiteralPath $gameRoot -Filter 'game_scarlett_master.exe' -File -Recurse -Depth 2 -ErrorAction SilentlyContinue)
