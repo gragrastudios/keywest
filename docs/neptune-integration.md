@@ -41,6 +41,8 @@ For Series S's lower rendering resolution, supply your own PC upscaler:
 .\tools\start-keywest.ps1 -FsrDll 'C:\path\to\amd_fidelityfx_upscaler_dx12.dll' -Warm -FrametimeDump
 ```
 
+The launcher also checks `%LOCALAPPDATA%\victory\dependencies\fidelityfx` for
+`amd_fidelityfx_upscaler_dx12.dll`; an explicit `-FsrDll` takes precedence.
 Without that DLL the automatic profile selects Series X. `-VramGB 8` or `12` reduces
 buffer and staging budgets. Command-list retention is capped below Neptune's original
 64 GB RAM profile. `-AutoAdvance` optionally taps A through the startup screens.
@@ -48,6 +50,8 @@ buffer and staging budgets. Command-list retention is capped below Neptune's ori
 The performance switches are opt-in through the launcher. Frame generation is not
 configured. The frame-time CSV goes to the configured cache folder as `frametime.csv`.
 Compare the same scene, console profile, and warmed shader cache when measuring changes.
+For this title, warm-up scans the executable, shader pack, and BVH builder instead of
+reading every unrelated game archive.
 
 ## Validation
 

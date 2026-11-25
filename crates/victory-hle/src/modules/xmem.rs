@@ -1366,6 +1366,18 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
+/// Runs its closure when dropped (diagnostics timing of a function with
+/// several returns).
+#[cfg(feature = "diagnostics")]
+struct Defer<F: FnMut()>(F);
+
+#[cfg(feature = "diagnostics")]
+impl<F: FnMut()> Drop for Defer<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1879,14 +1891,3 @@ mod tests {
     }
 }
 
-/// Runs its closure when dropped (diagnostics timing of a function with
-/// several returns).
-#[cfg(feature = "diagnostics")]
-struct Defer<F: FnMut()>(F);
-
-#[cfg(feature = "diagnostics")]
-impl<F: FnMut()> Drop for Defer<F> {
-    fn drop(&mut self) {
-        (self.0)();
-    }
-}

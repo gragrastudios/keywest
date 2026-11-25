@@ -1310,15 +1310,14 @@ fn filled(array: *const usize, n: usize) -> Vec<usize> {
     // request yet (or asks for the same pages again, which a short wait does not harm).
     let before = {
         let mut all = ENQUEUED.lock().unwrap_or_else(|e| e.into_inner());
-        let found = all.as_mut().and_then(|all| {
+        all.as_mut().and_then(|all| {
             let line = all.get_mut(&(array as usize))?;
             let before = line.pop_front();
             if line.is_empty() {
                 all.remove(&(array as usize));
             }
             before
-        });
-        found
+        })
     };
     let untouched = {
         let last = LAST_RUN.lock().unwrap_or_else(|e| e.into_inner());

@@ -13,6 +13,10 @@ param(
     [switch]$DryRun
 )
 $ErrorActionPreference = 'Stop'
+if (-not $FsrDll -and $Console -ne 'series-x') {
+    $cachedDll = Join-Path $env:LOCALAPPDATA 'victory\dependencies\fidelityfx\amd_fidelityfx_upscaler_dx12.dll'
+    if (Test-Path -LiteralPath $cachedDll -PathType Leaf) { $FsrDll = $cachedDll }
+}
 if (-not $DryRun) {
     if (-not (Test-Path -LiteralPath $Game -PathType Leaf)) { throw "Game executable not found: $Game. Finish copying the game before launching." }
     if (-not (Test-Path -LiteralPath $Runtime -PathType Leaf)) { throw "Runtime not found: $Runtime. Build with: cargo build --release -p victory" }
@@ -79,7 +83,16 @@ try {
     }
     Write-Host "KeyWest: $Console profile, $VramGB GB VRAM budget."
     if ($Warm) {
-        & $Runtime warm
+        # Avoid reading every texture/audio archive just to find shaders.
+        $shaderPack = Join-Path (Split-Path -Parent $Game) 'shaders.rpf'
+        if (Test-Path -LiteralPath $shaderPack -PathType Leaf) {
+            $inputs = @($Game, $shaderPack)
+            $builder = Join-Path (Split-Path -Parent $Game) 'XboxBvhBuilder.dll'
+            if (Test-Path -LiteralPath $builder -PathType Leaf) { $inputs += $builder }
+            & $Runtime warm @inputs --jobs $settings.VICTORY_WIDE_THREADS
+        } else {
+            & $Runtime warm --jobs $settings.VICTORY_WIDE_THREADS
+        }
         if ($LASTEXITCODE -ne 0) { throw "Shader warm-up failed ($LASTEXITCODE)." }
     }
     & $Runtime run $Game --execute --console $Console
