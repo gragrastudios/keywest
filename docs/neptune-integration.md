@@ -103,5 +103,17 @@ followed by upload-buffer and Rust allocation failures. Monitored reproductions
 confirmed commit exhaustion during loading/world entry. A separate experiment with
 a 3 GiB texture preload cap delayed exhaustion but still required the monitor to stop
 the process; that cap is not enabled by the launcher. Live logs also exposed the
-transient-window write loss addressed above. A stable world run and the visual effect
-of that correction remain unverified; no measured performance improvement is claimed.
+transient-window write loss addressed above.
+
+After a restart, a live test of runtime commit `6c79605` reached Chapter 1 and
+user-controlled boat driving without the immediate mission failure recurring.
+Ocean texture read-back was active at roughly 13 copies per frame. The profile was
+Series S, a 16 GB GPU buffer budget, and `-DropMips 1`. Four focused ocean, retained-mip,
+and buffer-lifetime regression tests also passed after the restart.
+
+The logged loading peaks were 16.3 GiB resident RAM and 22.7 GiB private commit;
+the observed boat view settled around 14 GiB resident and 20 GiB private commit.
+The last-minute median of interval FPS samples was 17.8, with hitches (one interval
+at 3 FPS). These are observations of one run, not a controlled before/after benchmark.
+Water still has visible rectangular patches; memory use remains substantial. Full
+mission completion and long-session stability were not established by this check.
