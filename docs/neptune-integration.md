@@ -147,6 +147,17 @@ require game validation.
 The combined all-features workspace passes 642 tests (10 intentionally ignored),
 and both default and all-features strict workspace Clippy pass.
 
+The release build at `45fda5a` warmed 25,758 shaders and 2,734 compute pipelines
+with zero refusals on the RTX 5060 Ti. A native Series S trial with `-DropMips 1`
+reached Jason's house and user-controlled outdoor play. The user still reported
+substantial flicker; bright speckled surface patches were also visible indoors.
+One outdoor sample had a median 10.5 FPS, 62 ms CPU preparation, and 17 ms heap
+processing across its last 12 logging intervals. This was not a controlled
+before/after benchmark. Resident RAM was about 14.2 GiB, with private commit
+about 19.5 GiB. The transient-window component held 4 MiB of CPU twins and a
+512 MiB upload pool, confirming that the earlier window memory reduction remains
+active. Overall memory consumption and frame rate still need improvement.
+
 The performance switches are opt-in through the launcher. Frame generation is not
 configured. The frame-time CSV goes to the configured cache folder as `frametime.csv`.
 Compare the same scene, console profile, and warmed shader cache when measuring changes.
