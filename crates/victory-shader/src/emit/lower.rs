@@ -4500,6 +4500,17 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Wave reads omit pixel helper lanes. Let a helper finish its
+    /// descriptor waterfall with its own value so derivatives remain usable.
+    fn helper_reads_own(&mut self, own: V, first: V) -> V {
+        if !self.s.pixel {
+            return first;
+        }
+        let c = self.cur;
+        let helper = self.s.op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        self.s.m.select(c, helper, own, first)
+    }
+
     /// The float value of a register value.
     fn float_of(&mut self, v: Value) -> Result<V, Why> {
         if let Some(&f) = self.floats.get(&v) {
@@ -4579,7 +4590,9 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            // Pixel quad reads must include helpers at triangle edges,
+            // even before a discard. Wave reads do not guarantee that.
+            let r = if mesh_quad || self.s.pixel && quad {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -6733,7 +6746,7 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        let mut r = if mesh_quad || self.s.pixel && quad {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
@@ -7642,6 +7655,7 @@ impl<'a> Lower<'a> {
                 } else {
                     mine
                 };
+                let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
             _ => {

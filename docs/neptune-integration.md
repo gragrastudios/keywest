@@ -86,7 +86,39 @@ This identifies avoidable allocations, not a measured saving: writable windows a
 the shared upload pool still consume RAM. The new transition passes a GPU transfer
 and read-back regression with concurrent promotion and a later CPU update. The
 default GPU suite passes 183 tests (3 ignored), and strict GPU Clippy passes.
-Live memory savings and the remaining black water patches still need validation.
+Whole-process savings and the remaining black water patches still need validation.
+
+### Follow-up on NVIDIA, November 26
+
+A five-minute native run of `93d1969` reached the world from a copy of the user's
+latest test saves. Loose-window CPU storage ranged from 4 MiB to about 252 MiB
+after four windows acquired CPU twins; the shared upload pool reached 512 MiB.
+The earlier run retained about 2.4 GiB in loose-window CPU twins. These are
+allocation-component observations across different scenes, not a controlled
+whole-process saving. Private commit still peaked at about 21.4 GiB. The outdoor
+scene's last intervals were about 10 FPS; black patches remained visible.
+
+The portable shader corrections are adapted from Belobug's
+[quad-helper change 03629f3](https://github.com/Belobug/VIctory-Belobug-AMD/commit/03629f3f0d3f3329052e05084440aeee75ce3107)
+and [first-lane helper correction f520772](https://github.com/Belobug/VIctory-Belobug-AMD/commit/f520772bd1675f7d4bc6397bdb84d5ddfb6b6d76),
+under GPL-3.0. Pixel quad permutations use quad operations that include uncovered
+helpers, and a pixel helper uses its own value for a first-lane read so descriptor
+loops can finish. Compute and mesh wave handling is preserved. A synthetic triangle
+test checks both quad instruction forms at uncovered neighbours on NVIDIA and WARP.
+That test also passes with the previous implementation on these adapters, so it
+does not identify these operations as the cause of the observed black patches.
+
+Repeated shader-write declarations and unaligned constant-buffer scratch fills
+are cached until a command-list operation writes title memory. These are adapted
+from romainhedouin's Belobug changes, via avatarmanz's
+[b32fb99](https://github.com/avatarmanz/VIctory-7900XTX/commit/b32fb9975d74600ac0812fd9424fa2d6829a004a)
+and [c96525d](https://github.com/avatarmanz/VIctory-7900XTX/commit/c96525dbb29daa12bc224813a3e64745520fae29),
+under GPL-3.0. The adaptation retains Neptune's constant-buffer wait policy and
+shader-written range tracking. Regression tests check two different constant
+snapshots around a title write and that shader-write declarations resume afterward.
+These reduce repeated work; an FPS improvement must be measured separately.
+The combined changes pass the default workspace's 625 tests (10 intentionally
+ignored) and strict all-features workspace Clippy.
 
 The performance switches are opt-in through the launcher. Frame generation is not
 configured. The frame-time CSV goes to the configured cache folder as `frametime.csv`.

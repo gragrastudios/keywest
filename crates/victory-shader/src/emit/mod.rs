@@ -2241,6 +2241,88 @@ mod barycentric_tests {
         emit(&c, &native, &p, &st, &io, &res).unwrap()
     }
 
+    /// A derivative's neighbour can be an uncovered helper at a triangle
+    /// edge. Exercise both GFX10 quad instructions on hardware and WARP.
+    #[test]
+    #[cfg(windows)]
+    fn pixel_quad_reads_include_uncovered_neighbours() {
+        let Some(dxc) = validator::Validator::default_path().map(|p| p.with_file_name("dxc.exe")).filter(|p| p.is_file()) else {
+            eprintln!("no PC shader compiler; skipped");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("keywest-quad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("vertex.hlsl");
+        let output = dir.join("vertex.dxil");
+        std::fs::write(&input, r#"
+            float4 main(uint id : SV_VertexID) : SV_Position {
+                float2 p[3] = { float2(-0.8,-0.7), float2(0.9,-0.5), float2(-0.3,0.85) };
+                return float4(p[id], 0.5, 1);
+            }
+        "#).unwrap();
+        let compiled = std::process::Command::new(&dxc)
+            .args(["-T", "vs_6_6", "-E", "main", "-Fo"]).arg(&output).arg(&input).output().unwrap();
+        assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
+        let vs_dxil = std::fs::read(&output).unwrap();
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for quad in [
+            [0xD800_0000 | 0x35 << 18 | 0x80B1, 2 << 24], // ds_swizzle v2, v0, swap X
+            [0x7E04_02FA, 0xFF00_B100], // v_mov_b32 v2, v0 quad_perm:[1,0,3,2]
+        ] {
+            let mut words = quad.to_vec();
+            words.extend([0x7E06_02F2, 0xF800_180F, 0x0301_0002, S_ENDPGM]);
+            let mut target = element("SV_Target", 16, 0);
+            target.usage = 15;
+            let ps = translate_with(HwStage::Ps, &words, StageIo::Ps {
+                inputs: vec![], input_addr: (1 << 8) | (1 << 9),
+                db_shader_control: 0, patches: vec![],
+            }, &[SigElement { interp: 4, ..element("SV_Position", 3, 0) }], &[target]);
+            validate(&ps);
+            let vs = HostShader {
+                stage: HwStage::Vs, dxil: vs_dxil.clone(), user_data: vec![],
+                samplers: vec![], static_samplers: vec![], root_cbvs: vec![],
+                root_srvs: vec![], root_uavs: vec![], root_indexed_views: vec![],
+            };
+            for warp in [false, true] {
+                let host = match super::host::Host::new(warp) {
+                    Ok(host) => host,
+                    Err(why) if !warp => { eprintln!("no hardware device: {why}; checking WARP"); continue; }
+                    Err(why) => panic!("WARP graphics device: {why}"),
+                };
+                let (root, pso) = host.pipeline(&vs, &ps).unwrap();
+                let pixels = host.draw(&root, &pso, &super::host::Draw {
+                    roots: vec![], textures: &[], samplers: &[], vertices: &[],
+                    stride: 0, size: (32, 32), mesh_groups: 0,
+                }).unwrap();
+                let mut edges = 0;
+                for (i, pixel) in pixels.iter().enumerate().filter(|(_, p)| p[3] == 1.0) {
+                    let x = i % 32;
+                    let other = x ^ 1;
+                    assert_eq!(pixel[0], other as f32 + 0.5, "quad neighbour at pixel {i}, WARP={warp}");
+                    assert_eq!(pixel[1], x as f32 + 0.5);
+                    if pixels[i / 32 * 32 + other][3] == 0.0 { edges += 1; }
+                }
+                assert!(edges > 5, "the triangle must exercise uncovered quad neighbours");
+            }
+        }
+    }
+
+    #[test]
+    fn pixel_first_lane_helper_path_validates() {
+        let mut target = element("SV_Target", 16, 0);
+        target.usage = 15;
+        let ps = translate_with(HwStage::Ps, &[
+            0x7E00_0500, // v_readfirstlane_b32 s0, v0
+            0x7E04_0200, // v_mov_b32 v2, s0
+            0x7E06_02F2, // v_mov_b32 v3, 1.0
+            0xF800_180F, 0x0301_0002, S_ENDPGM,
+        ], StageIo::Ps {
+            inputs: vec![], input_addr: (1 << 8) | (1 << 9),
+            db_shader_control: 0, patches: vec![],
+        }, &[SigElement { interp: 4, ..element("SV_Position", 3, 0) }], &[target]);
+        validate(&ps);
+    }
+
     fn packed(name: &str, kind: u8, comp: u8, row: u32, col: u8, cols: u8) -> SigElement {
         SigElement {
             col,

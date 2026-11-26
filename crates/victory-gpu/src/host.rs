@@ -924,6 +924,48 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn repeated_constants_keep_distinct_snapshots_across_title_writes() {
+        let host = super::host().expect("graphics adapter for constant scratch regression");
+        let list = host.new_list().unwrap();
+        let mut title = vec![11u32; 16];
+        let source = title.as_mut_ptr().cast::<u8>();
+        let first = list.constant_scratch(source, 64).unwrap();
+        assert_eq!(list.constant_scratch(source, 64), Some(first));
+        let at = source as usize;
+        list.defer(move || unsafe { (at as *mut u32).write(29) });
+        let second = list.constant_scratch(source, 64).unwrap();
+        assert_ne!(first, second, "a title write must invalidate the scratch cache");
+        let destinations: Vec<usize> = list.deferred().copies.iter().filter_map(|step| {
+            if let super::Step::Fill(dst, _, _, _) = step { Some(*dst) } else { None }
+        }).collect();
+        assert_eq!(destinations.len(), 2, "one fill per distinct title-memory state");
+        list.close();
+        host.execute(&[&list]);
+        // The list owns both mapped scratch ranges until it is dropped.
+        unsafe {
+            assert_eq!((destinations[0] as *const u32).read(), 11);
+            assert_eq!((destinations[1] as *const u32).read(), 29);
+        }
+    }
+
+    #[test]
+    fn shader_write_declarations_repeat_after_a_title_write() {
+        let host = super::host().expect("graphics adapter for declaration regression");
+        let list = host.new_list().unwrap();
+        let title = [0u8; 64];
+        let address = title.as_ptr() as usize;
+        let shadow = crate::shadow::find(address as u64, 64).unwrap();
+        list.defer_gpu_write(&shadow, address, 64);
+        list.defer_gpu_write(&shadow, address, 64);
+        assert!(list.gpu_written(address, 64));
+        list.defer(|| {});
+        list.defer_gpu_write(&shadow, address, 64);
+        let deferred = list.deferred();
+        let writes = deferred.copies.iter().filter(|s| matches!(s, super::Step::GpuWrite(..))).count();
+        assert_eq!(writes, 2, "deduplicate within a stretch but preserve declarations after title writes");
+    }
+
+    #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 5 << 16;
@@ -2619,6 +2661,10 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Repeated shader-write declarations within one stretch of title memory.
+    gpu_declared: std::collections::HashSet<(usize, usize, usize)>,
+    /// Unaligned root constants already copied to scratch in that stretch.
+    filled_constants: std::collections::HashMap<(usize, usize), u64>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -2651,6 +2697,12 @@ struct Deferred {
 }
 
 impl Deferred {
+    fn title_written(&mut self) {
+        self.refreshed.clear();
+        self.gpu_declared.clear();
+        self.filled_constants.clear();
+    }
+
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
@@ -7132,7 +7184,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        deferred.title_written();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -7160,6 +7212,19 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len, !wait));
+    }
+
+    /// Reuse a root constant buffer's scratch copy until this list writes
+    /// title memory. Keep Neptune's constant-fill ordering and wait policy.
+    pub(crate) fn constant_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        if let Some(gpu) = self.deferred().filled_constants.get(&key).copied() {
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_constants(to, src, len as usize);
+        self.deferred().filled_constants.insert(key, gpu);
+        Some(gpu)
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -7190,8 +7255,11 @@ impl HostList {
     ) {
         shader_writes(address, len);
         let mut deferred = self.deferred();
-        deferred.gpu_ranges.push((address, address + len));
-        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.gpu_declared.insert(key) {
+            deferred.gpu_ranges.push((address, address + len));
+            deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+        }
     }
 
     /// (Neptune) Whether shaders of the list, as recorded so far, may write
@@ -7399,8 +7467,9 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.title_written();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
