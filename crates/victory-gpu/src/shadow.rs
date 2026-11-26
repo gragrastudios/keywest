@@ -94,6 +94,10 @@ struct Card {
     /// the card's side before the next submission.
     /// `None` for a transient window ([`window_upload`]): no CPU side, `chunks` instead.
     staging: Option<ID3D12Resource>,
+    /// A read-only window acquires a CPU twin only when a shader first writes it.
+    promoted: std::sync::OnceLock<(ID3D12Resource, usize)>,
+    /// Serialize the transition with refreshes and draining queued uploads.
+    refresh: Mutex<()>,
     /// (Neptune) Transient window: the pages the title changed, each in a chunk of pooled
     /// upload memory (`crate::windowup`), in the order they were copied, until [`card_dirty`]
     /// takes them for the send.
@@ -115,6 +119,12 @@ struct Card {
     sent: Mutex<Vec<(usize, usize, u64)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+}
+
+impl Card {
+    fn staging(&self) -> Option<&ID3D12Resource> {
+        self.staging.as_ref().or_else(|| self.promoted.get().map(|p| &p.0))
+    }
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -463,10 +473,12 @@ pub(crate) fn card_dirty(sent_as: u64) -> (Vec<(Arc<Shadow>, Vec<(usize, usize)>
         if shadow.card.as_ref().is_some_and(|c| !c.flagged.swap(false, Ordering::AcqRel)) {
             return true;
         }
+        let _refresh = shadow.card.as_ref().filter(|c| c.staging.is_none())
+            .map(|c| c.refresh.lock().unwrap_or_else(|e| e.into_inner()));
         if shadow.transient() {
             let taken = shadow.card.as_ref().map(|c| std::mem::take(&mut *c.chunks.lock().unwrap_or_else(|e| e.into_inner())));
             if let Some(taken) = taken.filter(|t| !t.is_empty()) {
-                uploads.push((shadow, taken));
+                uploads.push((shadow.clone(), taken));
             }
             return true;
         }
@@ -485,7 +497,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> (Vec<(Arc<Shadow>, Vec<(usize, usize)>
             })
             .unwrap_or_default();
         if !ranges.is_empty() {
-            out.push((shadow, joined(ranges)));
+            out.push((shadow.clone(), joined(ranges)));
         }
         true
     });
@@ -1579,7 +1591,7 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
             // The snapshot's memory stays until the range is done with
             // (`copy_back_done`), which comes after this.
             match shadow.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                Some(before) => (shadow.data as usize, before.as_ptr() as usize, shadow.start as usize, from, to),
+                Some(before) => (shadow.data_ptr() as usize, before.as_ptr() as usize, shadow.start as usize, from, to),
                 None => (0, 0, 0, 0, 0),
             }
         })
@@ -1889,14 +1901,14 @@ pub(crate) fn copy_changed() -> bool {
 /// (Neptune) Whether windows outside buffers with a card side keep no CPU side
 /// (`VICTORY_CARD_WINDOW_UPLOAD=1`; off by default): the pages the title changed are copied
 /// at refresh into pooled upload memory (`crate::windowup`) and sent from there. Such a
-/// window ("transient") cannot be written by shaders: a buffer is not folded into one, and a
-/// declared shader write to one is counted and logged as an error.
+/// window ("transient") acquires a CPU twin on its first declared shader write,
+/// preserving normal buffer copy-back without reserving CPU twins for read-only windows.
 pub(crate) fn window_upload() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_WINDOW_UPLOAD").is_some_and(|v| v == "1"))
 }
 
-/// Transient windows alive, buffers not folded into one, shader writes declared to one.
+/// Transient windows alive, buffers not folded into one, windows promoted for shader writes.
 pub(crate) static TRANSIENT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Pages the copy-back told their copy it holds (`crate::watch::quiet_back`).
@@ -2443,8 +2455,8 @@ pub(crate) fn cpu_ranges() -> [Vec<(usize, usize)>; 2] {
     let sides = |shadows: Vec<Arc<Shadow>>| -> Vec<(usize, usize)> {
         let mut out: Vec<_> = shadows
             .iter()
-            .filter(|s| !s.data.is_null() && s.place.is_none() && !s.transient() && !s.rebar)
-            .map(|s| (s.data as usize, s.len as usize))
+            .filter(|s| !s.data_ptr().is_null() && s.place.is_none() && !s.transient() && !s.rebar)
+            .map(|s| (s.data_ptr() as usize, s.len as usize))
             .collect();
         out.sort_unstable();
         out.dedup();
@@ -2583,14 +2595,23 @@ impl Shadow {
         }
     }
 
+    fn data_ptr(&self) -> *mut u8 {
+        if !self.data.is_null() {
+            self.data
+        } else {
+            self.card.as_ref().and_then(|c| c.promoted.get())
+                .map_or(std::ptr::null_mut(), |p| p.1 as *mut u8)
+        }
+    }
+
     /// (Neptune) A window of title memory outside buffers with a card side and no CPU side
     /// ([`window_upload`]).
     pub(crate) fn transient(&self) -> bool {
-        self.window && self.card.as_ref().is_some_and(|c| c.staging.is_none())
+        self.window && self.card.as_ref().is_some_and(|c| c.staging().is_none())
     }
 
-    /// Whether this is a transient window that shaders are said to write: a bug (it keeps no
-    /// CPU side to merge into), logged once per window.
+    /// Ensure a shader-written window has a CPU twin for the normal merge path.
+    /// Rebar windows still cannot be read back safely.
     fn transient_written(&self, address: usize) -> bool {
         if self.rebar {
             // Nothing to merge into or compare with: write-combined memory is never read.
@@ -2608,16 +2629,29 @@ impl Shadow {
         if !self.transient() {
             return false;
         }
-        TRANSIENT[2].fetch_add(1, Ordering::Relaxed);
-        if !self.written_said.swap(true, Ordering::Relaxed) {
-            tracing::error!(
-                address = format_args!("{address:#x}"),
-                copy_start = format_args!("{:#x}", self.start),
-                copy_bytes = self.len,
-                "shaders write a transient window (VICTORY_CARD_WINDOW_UPLOAD=1): its writes are not merged back"
-            );
+        let card = self.card.as_ref().expect("transient window has a card");
+        // The journal lock precedes the refresh lock, as in copy_stale.
+        // Publish the CPU mapping before letting a refresh mark pages current.
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let _refresh = card.refresh.lock().unwrap_or_else(|e| e.into_inner());
+        if card.promoted.get().is_none() {
+            let (buffer, data) = host().and_then(|h| h.shared_buffer(self.len))
+                .unwrap_or_else(|| crate::host::fail(format_args!("cannot preserve shader writes to window {:#x}+{:#x}", self.start, self.len)));
+            // No shader write has been declared for this window yet. Establish
+            // a complete CPU baseline, including pages outside this write's view.
+            crate::host::copy_mapped(data, self.start as *const u8, self.len as usize, false);
+            // Older queued chunks must not overwrite this newer baseline.
+            card.chunks.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            assert!(card.promoted.set((buffer, data as usize)).is_ok());
+            copied.fill(0);
+            self.card_changed(0, self.len as usize);
+            TRANSIENT[0].fetch_sub(1, Ordering::Relaxed);
+            TRANSIENT[2].fetch_add(1, Ordering::Relaxed);
+            LIVE[1].fetch_add(self.len, Ordering::Relaxed);
+            tracing::debug!(address = format_args!("{address:#x}"), bytes = self.len,
+                "window acquired a CPU twin to preserve shader writes");
         }
-        true
+        false
     }
 
     /// (Neptune) Whether this is a window in a GPU upload heap ([`window_rebar`]).
@@ -2761,7 +2795,7 @@ impl Shadow {
                     let (lo, hi) = (lo.max(from), hi.min(to));
                     // SAFETY: as below; `hi <= total`.
                     unsafe {
-                        std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        std::ptr::copy_nonoverlapping(self.data_ptr().add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
                     }
                     kept.0[piece] = whole;
                 }
@@ -2775,7 +2809,7 @@ impl Shadow {
             // then. The snapshot's memory stays where it is until the
             // range is done with (`copy_back_done`).
             let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
-            let (data, snapshot) = (self.data as usize, snapshot.as_mut_ptr() as usize);
+            let (data, snapshot) = (self.data_ptr() as usize, snapshot.as_mut_ptr() as usize);
             snaps.extend(parts.into_iter().filter(|&(from, to)| from < to).map(|(from, to)| (data + from, snapshot + from, to - from)));
             return;
         }
@@ -2784,7 +2818,7 @@ impl Shadow {
                 // SAFETY: the copy's mapping and the snapshot's allocation
                 // (`pooled`) both hold `total` bytes, and `to <= total`.
                 unsafe {
-                    copy_wide(self.data.add(from), snapshot.as_mut_ptr().add(from), to - from);
+                    copy_wide(self.data_ptr().add(from), snapshot.as_mut_ptr().add(from), to - from);
                 }
             }
         }
@@ -2849,7 +2883,7 @@ impl Shadow {
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                let host = unsafe { std::slice::from_raw_parts_mut(self.data_ptr().add(at), n) };
                 let old = &before[at - from..at - from + n];
                 let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
                 let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
@@ -2925,7 +2959,7 @@ impl Shadow {
         // room just reserved; the card may write the mapping meanwhile, and
         // each byte read is one it held at some moment.
         unsafe {
-            std::ptr::copy_nonoverlapping(self.data.add(at), now.as_mut_ptr(), n);
+            std::ptr::copy_nonoverlapping(self.data_ptr().add(at), now.as_mut_ptr(), n);
             now.set_len(n);
         }
         // SAFETY: the snapshot's allocation holds the copy's length
@@ -2963,7 +2997,7 @@ impl Shadow {
     /// `from` on), as (offset, bytes) in order; compared on several threads
     /// when the range is big.
     fn differing(&self, from: usize, to: usize, before: &[u8]) -> Vec<(usize, usize)> {
-        let (start, data) = (self.start as usize, self.data as usize);
+        let (start, data) = (self.start as usize, self.data_ptr() as usize);
         let scan = |a: usize, b: usize| -> Vec<(usize, usize)> {
             let mut found = Vec::new();
             let mut at = a;
@@ -3209,7 +3243,7 @@ impl Shadow {
                     debug_assert!(!self.transient(), "no shader writes reach a transient window");
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
-                    let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                    let held = unsafe { std::slice::from_raw_parts_mut(self.data_ptr().add(at), n) };
                     let runs = changed_runs(title, held);
                     // (Neptune) As whole 32-bit words of title memory, joined
                     // where they touch (`under_writes_words`).
@@ -3240,7 +3274,7 @@ impl Shadow {
                         // SAFETY: inside the copy's mapping. The card may be
                         // writing the copy beside these bytes; they are
                         // written here and nothing around them.
-                        unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
+                        unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data_ptr().add(at + r), m) };
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
                         MERGED[1].fetch_add(1, Ordering::Relaxed);
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
@@ -3346,7 +3380,7 @@ impl Shadow {
         }
         // A transient window has no CPU side to look at; a rebar window's is write-combined
         // memory, which the CPU does not read.
-        if self.data.is_null() || self.rebar {
+        if self.data_ptr().is_null() || self.rebar {
             return;
         }
         const SAMPLE: usize = 256;
@@ -3361,7 +3395,7 @@ impl Shadow {
             if crate::host::read_into(at as *const u8, &mut title[..n]) {
                 // SAFETY: `[from, to)` lies inside the buffer (`update`),
                 // so these bytes are inside the copy's mapping.
-                let copy = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
+                let copy = unsafe { std::slice::from_raw_parts(self.data_ptr().add(at - start).cast_const(), n) };
                 let mut map = DIFFERING.lock().unwrap_or_else(|e| e.into_inner());
                 let map = map.get_or_insert_with(Default::default);
                 if copy == &title[..n] {
@@ -3441,6 +3475,8 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        let _refresh = self.card.as_ref().filter(|c| c.staging.is_none())
+            .map(|c| c.refresh.lock().unwrap_or_else(|e| e.into_inner()));
         // (Neptune) A transient window has no CPU side: the whole pages go into a chunk of
         // pooled upload memory, to be sent as they are (no byte compare, no snapshot).
         if self.transient() {
@@ -3451,14 +3487,14 @@ impl Shadow {
         if self.rebar {
             if to > from {
                 // SAFETY: inside the mapping (`from` and `to` are within the buffer).
-                let at = unsafe { self.data.add(from - start) };
+                let at = unsafe { self.data_ptr().add(from - start) };
                 crate::host::copy_mapped(at, from as *const u8, to - from, false);
                 REBAR[2].fetch_add((to - from) as u64, Ordering::Relaxed);
             }
             return to.saturating_sub(from);
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
-        let at = unsafe { self.data.add(from - start) };
+        let at = unsafe { self.data_ptr().add(from - start) };
         // (Neptune) A copy in the card's memory takes only what differs (`copy_changed`).
         if self.card.is_some() && to > from && to - from <= 16 << 20 && copy_changed() {
             let n = to - from;
@@ -3565,7 +3601,7 @@ impl Shadow {
     pub(crate) fn card_sides(&self) -> Option<(Option<&ID3D12Resource>, Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Some((card.staging.as_ref(), before, card.size))
+        Some((card.staging(), before, card.size))
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -3660,7 +3696,7 @@ impl Shadow {
         }
         // SAFETY: inside the mapping (checked above); only the submitting
         // thread writes it.
-        let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        let old = unsafe { std::slice::from_raw_parts_mut(self.data_ptr().add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, old) else {
             return 0;
         };
@@ -3731,7 +3767,7 @@ impl Shadow {
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
         // holds the lock held here.
-        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        let held = unsafe { std::slice::from_raw_parts_mut(self.data_ptr().add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, held) else {
             return 0;
         };
@@ -4093,6 +4129,8 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 );
                 let card = Card {
                     staging: Some(buffer),
+                    promoted: std::sync::OnceLock::new(),
+                    refresh: Mutex::new(()),
                     chunks: Mutex::default(),
                     flagged: std::sync::atomic::AtomicBool::new(true),
                     before: Mutex::default(),
@@ -4352,6 +4390,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card (transient)"));
         let card = Card {
             staging: None,
+            promoted: std::sync::OnceLock::new(),
+            refresh: Mutex::new(()),
             chunks: Mutex::default(),
             flagged: std::sync::atomic::AtomicBool::new(true),
             before: Mutex::default(),
@@ -4370,6 +4410,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
                 let card = Card {
                     staging: Some(buffer),
+                    promoted: std::sync::OnceLock::new(),
+                    refresh: Mutex::new(()),
                     chunks: Mutex::default(),
                     flagged: std::sync::atomic::AtomicBool::new(true),
                     before: Mutex::default(),
@@ -4637,6 +4679,81 @@ mod card_merge_tests {
     }
 
     #[test]
+    fn transient_window_promotes_once_and_preserves_gpu_writes() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use std::sync::atomic::Ordering;
+        let host = super::host().expect("graphics adapter for window promotion regression");
+        const LEN: usize = 64 << 10;
+        let mut title: Vec<u8> = (0..LEN).map(|i| (i * 7 + 3) as u8).collect();
+        let original = title.clone();
+        let start = title.as_mut_ptr() as u64;
+        let buffer = host.uav_buffer(LEN as u64).unwrap();
+        let mut shadow = Shadow::new(buffer, std::ptr::null_mut(), 0, start, LEN as u64);
+        shadow.window = true;
+        shadow.card = Some(Card {
+            staging: None,
+            promoted: std::sync::OnceLock::new(),
+            refresh: Mutex::new(()),
+            chunks: Mutex::default(),
+            flagged: std::sync::atomic::AtomicBool::new(true),
+            before: Mutex::default(),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            size: LEN as u64,
+        });
+        super::LIVE[1].fetch_sub(LEN as u64, Ordering::Relaxed);
+        super::TRANSIENT[0].fetch_add(1, Ordering::Relaxed);
+        super::WINDOW_CARD_BYTES.fetch_add(LEN as u64, Ordering::Relaxed);
+        assert!(shadow.transient());
+        assert!(shadow.data_ptr().is_null(), "read-only windows must not reserve CPU twins");
+        shadow.copy(start as usize, start as usize + LEN);
+        shadow.copied.lock().unwrap().fill(7);
+        let gpu_address = shadow.gpu;
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let shadow = &shadow;
+                scope.spawn(move || assert!(!shadow.transient_written(start as usize)));
+            }
+        });
+        assert!(!shadow.transient());
+        assert_eq!(shadow.gpu, gpu_address, "promotion must preserve recorded GPU addresses");
+        let card = shadow.card.as_ref().unwrap();
+        assert!(card.chunks.lock().unwrap().is_empty(), "stale chunks must not undo the new baseline");
+        assert_eq!(*card.dirty.lock().unwrap(), vec![(0, LEN)]);
+        assert!(shadow.copied.lock().unwrap().iter().all(|&v| v == 0));
+        let mapping = shadow.data_ptr();
+        assert!(!shadow.transient_written(start as usize));
+        assert_eq!(shadow.data_ptr(), mapping, "subsequent writes reuse the CPU twin");
+        // Actual GPU transfer into the existing buffer, a GPU write to four
+        // bytes, and read-back through the same merge used by shader results.
+        let (upload, data) = host.upload_buffer(4).unwrap();
+        let changed = [0x91, 0x82, 0x73, 0x64];
+        let readback = host.read_back_buffer(LEN as u64).unwrap();
+        let list = host.new_list().unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(changed.as_ptr(), data, changed.len());
+            list.list.CopyBufferRegion(&shadow.buffer, 0, card.staging().unwrap(), 0, LEN as u64);
+            list.list.CopyBufferRegion(&shadow.buffer, 128, &upload, 0, 4);
+            list.list.ResourceBarrier(&[crate::host::transition(&shadow.buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            list.list.CopyBufferRegion(&readback, 0, &shadow.buffer, 0, LEN as u64);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let mut bytes = std::ptr::null_mut();
+        unsafe { readback.Map(0, None, Some(&mut bytes)).unwrap() };
+        let fetched = unsafe { std::slice::from_raw_parts(bytes.cast::<u8>(), LEN) };
+        assert_eq!(&fetched[128..132], &changed);
+        // A later CPU write to an untouched byte must survive the GPU result.
+        title[17] ^= 0x5a;
+        assert_eq!(shadow.card_merge(0, fetched, &mut Vec::new()), 4);
+        assert_eq!(&title[128..132], &changed);
+        assert_eq!(title[17], original[17] ^ 0x5a);
+        assert_eq!(&title[132..], &original[132..]);
+        unsafe { readback.Unmap(0, None) };
+    }
+
+    #[test]
     fn lookup_cache_does_not_keep_unregistered_buffer_copies_alive() {
         let buffer = warp_buffer().expect("WARP buffer for lifetime regression");
         let mut title = vec![0u8; 64 << 10];
@@ -4696,6 +4813,8 @@ mod card_merge_tests {
             let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, title.as_ptr() as u64, LEN as u64);
             shadow.card = Some(Card {
                 staging: Some(staging.clone()),
+                promoted: std::sync::OnceLock::new(),
+                refresh: Mutex::new(()),
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),

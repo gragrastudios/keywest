@@ -72,10 +72,21 @@ Windows commit, and idle command lists are trimmed after five seconds. These cha
 reduce avoidable retention; the title's own allocations and live GPU resources remain
 necessary and a fixed RAM target is not guaranteed.
 
-Transient window uploads are disabled in the launcher. Live world-entry logs showed
-shader writes reaching these windows, which have no CPU copy to merge writes back
-into. The regular window path retains that copy. This removes the unsafe profile
-setting; it does not establish that all geometry or shading defects are resolved.
+Read-only loose windows now use pooled uploads instead of keeping a CPU twin for
+each GPU buffer. A window's first declared shader write creates its CPU twin and
+switches to the regular merge path, preserving the buffer and its GPU address.
+The transition serializes with refreshes, invalidates the page journal, and replaces
+queued chunks with a complete baseline upload so old chunks cannot undo it.
+This corrects the write loss that previously required disabling transient windows.
+Use `-KeepWindowCpuCopies` to compare with the previous profile. Rebuild the runtime
+before using the updated launcher: older runtimes do not implement this transition.
+
+The live run before this change held about 2.4 GiB in loose-window CPU twins.
+This identifies avoidable allocations, not a measured saving: writable windows and
+the shared upload pool still consume RAM. The new transition passes a GPU transfer
+and read-back regression with concurrent promotion and a later CPU update. The
+default GPU suite passes 183 tests (3 ignored), and strict GPU Clippy passes.
+Live memory savings and the remaining black water patches still need validation.
 
 The performance switches are opt-in through the launcher. Frame generation is not
 configured. The frame-time CSV goes to the configured cache folder as `frametime.csv`.

@@ -22,6 +22,8 @@ World loading has been confirmed, with remaining rendering and performance defec
 Ocean simulation read-back is enabled so GPU water heights reach CPU buoyancy code.
 The launcher defaults to omitting one finest mip from eligible large textures to
 reduce memory and upload work; `-DropMips 0` restores full texture detail.
+Read-only memory windows use pooled uploads; CPU copies are allocated when shaders
+write them. `-KeepWindowCpuCopies` restores the previous memory profile for comparison.
 The figures below describe earlier fork builds. The performance launcher is
 `tools/start-keywest.ps1`; use `-DryRun` to inspect its configuration.
 

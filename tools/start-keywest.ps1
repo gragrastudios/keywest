@@ -8,6 +8,7 @@ param(
     [string]$FsrDll,
     [ValidateSet(8, 12, 16, 24)][int]$VramGB = 16,
     [ValidateRange(0, 4)][int]$DropMips = 1,
+    [switch]$KeepWindowCpuCopies,
     [switch]$Warm,
     [switch]$AutoAdvance,
     [switch]$FrametimeDump,
@@ -75,8 +76,8 @@ $settings = [ordered]@{
     VICTORY_TEXTURE_DROP_MIPS = $DropMips.ToString()
     VICTORY_OCEAN_READBACK = '1'
     VICTORY_WINDOW_KB = '1024'
-    # Live world entry writes these windows; transient uploads discard those writes.
-    VICTORY_CARD_WINDOW_UPLOAD = '0'
+    # Read-only windows use pooled uploads; shader-written windows acquire CPU twins.
+    VICTORY_CARD_WINDOW_UPLOAD = $(if ($KeepWindowCpuCopies) { '0' } else { '1' })
     VICTORY_DROP_DXIL = '1'
     VICTORY_DESC_DATA = '1'
     VICTORY_VRAM_IDLE_MS = '15000,2500,1000'
