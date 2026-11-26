@@ -3872,8 +3872,11 @@ struct Entry {
 static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::RwLock::new(BTreeMap::new());
 
 fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    SHAPE.fetch_add(1, Ordering::Release);
-    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+    let table = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
+    // Readers of the old table must not cache their answer under the new
+    // generation while a writer is still waiting for this lock.
+    SHAPE.fetch_add(1, Ordering::SeqCst);
+    table
 }
 
 /// (Neptune) Counts the takings of the two tables' locks to write (title buffers, windows):
@@ -3882,8 +3885,9 @@ static SHAPE: AtomicU64 = AtomicU64::new(0);
 
 /// The windows' table, to change it.
 fn loose_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, u64), Arc<Shadow>>> {
-    SHAPE.fetch_add(1, Ordering::Release);
-    LOOSE.write().unwrap_or_else(|e| e.into_inner())
+    let table = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    SHAPE.fetch_add(1, Ordering::SeqCst);
+    table
 }
 
 thread_local! {
@@ -3907,12 +3911,14 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     if !lookup_cache() {
         return lookup_tables(address, len, any);
     }
-    let shape = SHAPE.load(Ordering::Acquire);
+    let shape = SHAPE.load(Ordering::SeqCst);
     let hit = FOUND.with(|found| {
         let found = found.borrow();
         (found.0 == shape).then(|| found.1.get(&(address, len, any)).and_then(std::sync::Weak::upgrade)).flatten()
     });
-    if let Some(shadow) = hit {
+    // A sweep or registration can begin while the weak entry is upgraded.
+    // Linearize a cache hit before that change, or retry through the tables.
+    if let Some(shadow) = hit.filter(|_| SHAPE.load(Ordering::SeqCst) == shape) {
         // Still in use (what lets idle copies go looks at this).
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         return Some(shadow);
@@ -3921,7 +3927,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     if let Some(shadow) = &found {
         // A concurrent registration/removal may have replaced what this lookup saw.
         // Do not publish that old result with the new generation's stamp.
-        if SHAPE.load(Ordering::Acquire) != shape {
+        if SHAPE.load(Ordering::SeqCst) != shape {
             return found;
         }
         FOUND.with(|kept| {
@@ -4888,5 +4894,46 @@ mod run_tests {
         done.extend(run);
         let p = PAGE;
         assert_eq!(done, [(p + 4096, p + 3 * 4096), (p + 15 * 4096, 2 * p + 2 * 4096), (4 * p, 5 * p)]);
+    }
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::{SHAPE, buffers, register, unregister};
+    use std::sync::{Barrier, atomic::Ordering};
+    use std::time::{Duration, Instant};
+
+    /// A registration that waits for the table's lock has not counted yet:
+    /// who reads the old table reads it under the old count (fork pull
+    /// request #1245's test).
+    #[test]
+    fn a_pending_registration_invalidates_readers_of_the_old_table() {
+        // No card: the address of a stack slot is the key.
+        let slot = 0u64;
+        let start = (&raw const slot) as u64;
+        let resource = start as usize;
+        let table = buffers();
+        let initial = SHAPE.load(Ordering::Acquire);
+        let ready = Barrier::new(2);
+        let observed = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                ready.wait();
+                register(resource, start, 8);
+            });
+            ready.wait();
+            // Time for a writer that counted before taking the lock to
+            // show it; a right one stays blocked all the while.
+            let deadline = Instant::now() + Duration::from_millis(50);
+            while SHAPE.load(Ordering::Acquire) == initial && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let count = SHAPE.load(Ordering::Acquire);
+            assert!(!table.contains_key(&(start, resource)));
+            drop(table);
+            count
+        });
+        let committed = SHAPE.load(Ordering::Acquire);
+        unregister(resource, start);
+        assert_ne!(committed, observed, "the old table still has the current count");
     }
 }

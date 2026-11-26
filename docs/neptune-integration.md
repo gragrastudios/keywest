@@ -120,6 +120,33 @@ These reduce repeated work; an FPS improvement must be measured separately.
 The combined changes pass the default workspace's 625 tests (10 intentionally
 ignored) and strict all-features workspace Clippy.
 
+### Upstream correctness fixes
+
+Three further defects were reproduced locally before adapting the fixes:
+
+- [Upstream 19a45d1 / PR #1241](https://github.com/fxceless/victory-fork/commit/19a45d1924c21002c7d55834cb2df39b927becb1):
+  a CPU upload no longer counts as the GPU alias copy owed to a sampled view.
+  The NVIDIA regression read back zero before the fix and the expected packed
+  lighting value afterward. Each list tracks which GPU source it last copied.
+- [Upstream bc6ee68 / PR #1245](https://github.com/fxceless/victory-fork/commit/bc6ee68ea17030fa9531837e395404cfd1856656):
+  cache generations advance under the table's write lock, and a weak cache hit
+  checks the generation again after upgrading. This adaptation retains Neptune's
+  read-write tables and the weak entries that avoid retaining unused GPU copies.
+  The pending-registration regression failed before the change and passes after it.
+- [Garu667's PR #1261](https://github.com/fxceless/victory-fork/pull/1261), commit
+  `61f7df74b486134b069d5cfbfe6dfe55ac45613b`: unpaired compute groups with console
+  lane operations take thread ranges from a group counter. On this NVIDIA card,
+  the old 32-by-2 case wrote only 32 of 64 outputs. All outputs are now written,
+  including in 16-by-4, 8-by-8, 16-by-3, and 8-by-6 cases; the test also covers
+  the 32 KiB LDS limit. Neptune's paired Wave64 counter is preserved.
+  `VICTORY_THREAD_TICKET=0` restores the old mapping for comparison.
+
+These adaptations retain the upstream GPL-3.0 source attribution. The regression
+results establish the corrected behavior; visual flicker and frame rate still
+require game validation.
+The combined all-features workspace passes 642 tests (10 intentionally ignored),
+and both default and all-features strict workspace Clippy pass.
+
 The performance switches are opt-in through the launcher. Frame generation is not
 configured. The frame-time CSV goes to the configured cache folder as `frametime.csv`.
 Compare the same scene, console profile, and warmed shader cache when measuring changes.

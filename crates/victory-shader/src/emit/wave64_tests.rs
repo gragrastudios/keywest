@@ -1234,3 +1234,64 @@ fn an_allocation_in_units_of_a_size_is_the_idiom() {
     assert_eq!(idiom(&program(5)), Ok(()));
     assert!(idiom(&program(2)).is_err(), "the count as the base");
 }
+
+/// Console wave32 thread ids cover 2-D groups exactly once, including a
+/// partial final wave and a program at the 32 KiB LDS limit.
+#[test]
+fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
+    for (width, height, lds_bytes) in [(32u32, 2, 0), (16, 4, 32768), (8, 8, 0), (16, 3, 0), (8, 6, 0)] {
+        let words = [
+            0xD765_0003, // v_mbcnt_lo_u32_b32 v3, exec_lo, 0
+            0x0001_007E,
+            0x3408_0280 | width.trailing_zeros(), // v4 = y * width
+            0x4A08_0104, // v_add_nc_u32 v4, v4, v0
+            0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+            0x7E0A_0281, // v_mov_b32 v5, 1
+            0x38 << 26 | 0x1C << 18 | 1 << 12,
+            0x80 << 24 | 2 << 16 | 5 << 8 | 4, // buffer_store_dword v5, v4, s[8:11], 0 offen
+        ];
+        let mut native = native_of(&words, false, width * height);
+        native.io = StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1 | 1 << 11 | (lds_bytes / 512) << 15, // 5 user SGPRs, thread ids x and y in v0, v1
+            threads: [width, height, 1],
+        });
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let shader = lowered_on(&native, &p, &HashSet::new(), 32).expect("lower");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 hardware device; not run");
+            return;
+        };
+        let run = |shader: &HostShader| -> Option<Vec<u32>> {
+            let (root, pso) = match host.compute_pipeline(shader) {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("the hardware device does not take this program: {e}; not run");
+                    return None;
+                }
+            };
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(width * height)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+            Some(out[0][..(width * height) as usize].to_vec())
+        };
+        let Some(got) = run(&shader) else { return };
+        let missing: Vec<usize> = (0..(width * height) as usize).filter(|&i| got[i] != 1).collect();
+        assert!(missing.is_empty(), "{width}x{height}: dwords not written once: {missing:?}");
+        eprintln!("ran on the hardware device: {width}x{height} console threads, each once; LDS {lds_bytes}");
+    }
+}
