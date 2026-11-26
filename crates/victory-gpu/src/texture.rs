@@ -47,6 +47,10 @@ pub(crate) struct Staging {
     /// read for it and the smaller ones.
     first: u32,
     size: usize,
+    /// The title's levels the host texture leaves out
+    /// (`crate::resource::drop_levels`): host level `m` is title level
+    /// `m + drop`.
+    drop: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
@@ -135,6 +139,11 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
+    // Host copies with other levels than each other's: filled from title
+    // memory instead (`crate::resource::drop_levels`).
+    if crate::resource::dropped(placed) != crate::resource::dropped(source) {
+        return false;
+    }
     let (Some(to), Some(from)) = (
         crate::resource::host_resource(placed),
         crate::resource::host_resource(source),
@@ -542,7 +551,7 @@ pub(crate) fn let_go_idle() {
     if map.is_empty() {
         return;
     }
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let idle_ms = crate::host::ram_idle_ms(crate::host::available_cache_memory());
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
@@ -1297,7 +1306,7 @@ impl Staging {
             }
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, mip + self.drop, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
@@ -1424,7 +1433,7 @@ fn staged_from(resource: This) -> u32 {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     map.as_ref()
         .and_then(|map| map.get(&(resource as usize)))
-        .map_or(u32::MAX, |s| s.first)
+        .map_or(u32::MAX, |s| s.first + s.drop)
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -1595,9 +1604,10 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     // Asked before the table is locked: the sweep lets go of a staging
     // buffer with its texture's host side locked, in that order.
     let on_demand = crate::resource::host_tiled(resource).is_some();
+    let drop = crate::resource::dropped(resource);
     // (Neptune) A texture made level by level stages every level (zeros for the ones the
     // title does not hold): its upload gives the card's memory by the same answer.
-    let first = if on_demand { 0 } else { first };
+    let first = if on_demand { 0 } else { first.saturating_sub(drop) };
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize))
@@ -1621,7 +1631,8 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
-    let (first, size) = staged_part(&layout, u32::from(d.MipLevels), first);
+    let (title_first, size) = staged_part(&layout, layout.desc.mips, first + drop);
+    let first = title_first.saturating_sub(drop);
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
@@ -1664,6 +1675,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         mips: u32::from(d.MipLevels),
         first,
         size,
+        drop,
         bytes: total,
         memory,
         last: Mutex::default(),

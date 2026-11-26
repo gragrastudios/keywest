@@ -2410,7 +2410,7 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+        let idle_ms = crate::host::ram_idle_ms(crate::host::available_cache_memory());
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
@@ -3852,8 +3852,9 @@ fn loose_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, u64), Ar
 
 thread_local! {
     /// (Neptune) What this thread's look-ups found, while [`SHAPE`] stands: the count, and
-    /// the copy by (address, length, any).
-    static FOUND: std::cell::RefCell<(u64, std::collections::HashMap<(u64, u64, bool), Arc<Shadow>>)> =
+    /// the copy by (address, length, any). Weak entries do not pin idle GPU copies
+    /// when their recording thread stops making look-ups.
+    static FOUND: std::cell::RefCell<(u64, std::collections::HashMap<(u64, u64, bool), std::sync::Weak<Shadow>>)> =
         std::cell::RefCell::new((u64::MAX, std::collections::HashMap::new()));
 }
 
@@ -3873,7 +3874,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let shape = SHAPE.load(Ordering::Acquire);
     let hit = FOUND.with(|found| {
         let found = found.borrow();
-        (found.0 == shape).then(|| found.1.get(&(address, len, any)).cloned()).flatten()
+        (found.0 == shape).then(|| found.1.get(&(address, len, any)).and_then(std::sync::Weak::upgrade)).flatten()
     });
     if let Some(shadow) = hit {
         // Still in use (what lets idle copies go looks at this).
@@ -3882,15 +3883,18 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     }
     let found = lookup_tables(address, len, any);
     if let Some(shadow) = &found {
-        // The count as it stands now: a copy made by this very look-up moved it.
-        let shape = SHAPE.load(Ordering::Acquire);
+        // A concurrent registration/removal may have replaced what this lookup saw.
+        // Do not publish that old result with the new generation's stamp.
+        if SHAPE.load(Ordering::Acquire) != shape {
+            return found;
+        }
         FOUND.with(|kept| {
             let mut kept = kept.borrow_mut();
             if kept.0 != shape || kept.1.len() >= 8192 {
                 kept.1.clear();
                 kept.0 = shape;
             }
-            kept.1.insert((address, len, any), shadow.clone());
+            kept.1.insert((address, len, any), Arc::downgrade(shadow));
         });
     }
     found
@@ -4630,6 +4634,38 @@ mod card_merge_tests {
                 .ok()?;
             buffer
         }
+    }
+
+    #[test]
+    fn lookup_cache_does_not_keep_unregistered_buffer_copies_alive() {
+        let buffer = warp_buffer().expect("WARP buffer for lifetime regression");
+        let mut title = vec![0u8; 64 << 10];
+        let start = title.as_ptr() as u64;
+        let shadow = std::sync::Arc::new(Shadow::new(
+            buffer,
+            title.as_mut_ptr(),
+            0,
+            start,
+            title.len() as u64,
+        ));
+        let weak = std::sync::Arc::downgrade(&shadow);
+        let resource = std::sync::Arc::as_ptr(&shadow) as usize;
+        super::buffers().insert(
+            (start, resource),
+            super::Entry {
+                end: start + title.len() as u64,
+                shadow: Some(shadow.clone()),
+            },
+        );
+        let found = super::lookup(start, title.len() as u64, false).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&found, &shadow));
+        drop(found);
+        super::unregister(resource, start);
+        drop(shadow);
+        assert!(
+            weak.upgrade().is_none(),
+            "an inactive recording thread's lookup cache must not pin GPU copies"
+        );
     }
 
     /// The mixed landing the fetch inside flights must survive, on a real

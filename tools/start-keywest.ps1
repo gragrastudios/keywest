@@ -7,6 +7,7 @@ param(
     [ValidateSet('auto', 'series-s', 'series-x')][string]$Console = 'auto',
     [string]$FsrDll,
     [ValidateSet(8, 12, 16, 24)][int]$VramGB = 16,
+    [ValidateRange(0, 4)][int]$DropMips = 1,
     [switch]$Warm,
     [switch]$AutoAdvance,
     [switch]$FrametimeDump,
@@ -66,10 +67,13 @@ $settings = [ordered]@{
     VICTORY_QUIET_BACK = '1'
     VICTORY_LIST_POOL_MOST = '1024'
     VICTORY_LIST_POOL_MB = '512'
+    VICTORY_LIST_POOL_IDLE_S = '5'
     VICTORY_WIDE_THREADS = ([Math]::Min(12, [Environment]::ProcessorCount)).ToString()
     VICTORY_INDIRECT_RAW = '2'
     VICTORY_TEXTURE_HASH_EVERY = '32'
     VICTORY_LEVELS_ON_DEMAND = '1'
+    VICTORY_TEXTURE_DROP_MIPS = $DropMips.ToString()
+    VICTORY_OCEAN_READBACK = '1'
     VICTORY_WINDOW_KB = '1024'
     # Live world entry writes these windows; transient uploads discard those writes.
     VICTORY_CARD_WINDOW_UPLOAD = '0'
@@ -93,6 +97,7 @@ try {
         [Environment]::SetEnvironmentVariable($name, $settings[$name], 'Process')
     }
     Write-Host "KeyWest: $Console profile, $VramGB GB VRAM budget."
+    Write-Host "Ocean simulation read-back enabled; largest texture mip levels omitted: $DropMips (-DropMips 0 for full texture detail)."
     if ($Warm) {
         # Avoid reading every texture/audio archive just to find shaders.
         $shaderPack = Join-Path (Split-Path -Parent $Game) 'shaders.rpf'

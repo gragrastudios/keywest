@@ -6,7 +6,7 @@
 //! (R32G32_FLOAT) that its CPU code samples, which is what boats float on.
 //! Without the texels there the physics sees no water: boats sink.
 //!
-//! Off by default; `VICTORY_OCEAN_READBACK=1` switches it on. A list in which
+//! On by default; `VICTORY_OCEAN_READBACK=0` switches it off. A list in which
 //! shaders write a texture of a kind in `VICTORY_TEXTURE_BACK` (comma-
 //! separated `<width>x<height>f<DXGI format>`, by default the kinds the
 //! title was seen reading: `256x256f41,256x256f16,64x64f16,128x128f36`)
@@ -31,10 +31,11 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::object::This;
 
-/// Whether the copy-back is on (`VICTORY_OCEAN_READBACK=1`).
+/// Ocean simulation outputs must reach the CPU for buoyancy to work.
+/// `VICTORY_OCEAN_READBACK=0` is a diagnostic opt-out.
 fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_OCEAN_READBACK").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_OCEAN_READBACK").is_none_or(|v| v != "0"))
 }
 
 /// The kinds copied back: (width, height, format).
@@ -44,19 +45,24 @@ fn kinds() -> &'static [(u64, u32, u32)] {
         if !on() {
             return Vec::new();
         }
-        const DEFAULT: &str = "256x256f41,256x256f16,64x64f16,128x128f36";
-        let list = std::env::var("VICTORY_TEXTURE_BACK").unwrap_or_else(|_| DEFAULT.to_owned());
-        let kinds: Vec<(u64, u32, u32)> = list
-            .split(',')
-            .filter_map(|k| {
-                let (size, format) = k.trim().split_once('f')?;
-                let (w, h) = size.split_once('x')?;
-                Some((w.parse().ok()?, h.parse().ok()?, format.parse().ok()?))
-            })
-            .collect();
+        let kinds = parse_kinds(std::env::var("VICTORY_TEXTURE_BACK").ok().as_deref());
         tracing::info!(?kinds, "textures of these kinds that shaders write are copied back into title memory (VICTORY_OCEAN_READBACK=1)");
         kinds
     })
+}
+
+/// The upstream boolean form selects the same simulation maps as an unset list.
+fn parse_kinds(value: Option<&str>) -> Vec<(u64, u32, u32)> {
+    const DEFAULT: &str = "256x256f41,256x256f16,64x64f16,128x128f36";
+    let list = match value.map(str::trim) {
+        None | Some("1") => DEFAULT,
+        Some(list) => list,
+    };
+    list.split(',').filter_map(|kind| {
+        let (size, format) = kind.trim().split_once('f')?;
+        let (w, h) = size.split_once('x')?;
+        Some((w.parse().ok()?, h.parse().ok()?, format.parse().ok()?))
+    }).collect()
 }
 
 /// The tile (swizzle) modes whose textures are copied back: `VICTORY_TEXTURE_BACK_MODES`, a
@@ -205,5 +211,140 @@ pub(crate) fn land(back: &Back) {
     if tiled_ok {
         crate::host::copy_mapped(back.at as *mut u8, tiled.as_ptr(), back.size, true);
         LANDED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    #[test]
+    fn upstream_boolean_readback_setting_keeps_the_ocean_maps() {
+        let expected = vec![(256, 256, 41), (256, 256, 16), (64, 64, 16), (128, 128, 36)];
+        assert_eq!(parse_kinds(None), expected);
+        assert_eq!(parse_kinds(Some("1")), expected);
+        assert_eq!(parse_kinds(Some("128x64f41")), vec![(128, 64, 41)]);
+        assert!(parse_kinds(Some("0")).is_empty());
+    }
+
+    #[test]
+    fn ocean_height_and_displacement_written_on_gpu_reach_cpu_memory() {
+        let host = crate::host::host().expect("a graphics adapter for ocean read-back");
+        for (format, channels) in [
+            (DXGI_FORMAT_R32_FLOAT, 1usize),
+            (DXGI_FORMAT_R32G32_FLOAT, 2),
+        ] {
+            let layout = Layout::new(&Desc {
+                dimension: Dimension::Tex2d,
+                width: 256,
+                height: 256,
+                depth: 1,
+                mips: 1,
+                element_bytes: (channels * 4) as u32,
+                block: 1,
+                samples: 1,
+                swizzle: Swizzle::LINEAR,
+            })
+            .unwrap();
+            let mut title = vec![0x5au8; layout.size as usize];
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 256,
+                Height: 256,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            // SAFETY: test-owned texture, descriptors, and read-back buffer; GPU work is
+            // waited for before land maps the buffer and writes into the live title Vec.
+            unsafe {
+                let mut texture: Option<ID3D12Resource> = None;
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+                let texture = texture.unwrap();
+                let rtv: ID3D12DescriptorHeap = host
+                    .device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                        NumDescriptors: 1,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let handle = rtv.GetCPUDescriptorHandleForHeapStart();
+                host.device.CreateRenderTargetView(&texture, None, handle);
+                let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+                let mut rows = 0;
+                let mut total = 0;
+                host.device.GetCopyableFootprints(
+                    &desc,
+                    0,
+                    1,
+                    0,
+                    Some(&mut footprint),
+                    Some(&mut rows),
+                    None,
+                    Some(&mut total),
+                );
+                let buffer = host.read_back_buffer(total).unwrap();
+                let list = host.new_list().unwrap();
+                list.list
+                    .ClearRenderTargetView(handle, &[1.25, -0.5, 0.0, 0.0], None);
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &texture,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    ..Default::default()
+                };
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&buffer),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: footprint,
+                    },
+                };
+                list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                list.close();
+                host.execute(&[&list]);
+                let size = title.len();
+                land(&Back {
+                    buffer,
+                    footprints: vec![footprint],
+                    rows: vec![rows],
+                    mips: 1,
+                    layout,
+                    at: title.as_mut_ptr() as usize,
+                    size,
+                });
+            }
+            for pixel in title[..256 * 256 * channels * 4].chunks_exact(channels * 4) {
+                assert_eq!(f32::from_le_bytes(pixel[..4].try_into().unwrap()), 1.25);
+                if channels == 2 {
+                    assert_eq!(f32::from_le_bytes(pixel[4..8].try_into().unwrap()), -0.5);
+                }
+            }
+        }
     }
 }

@@ -18,9 +18,12 @@ tools, while retaining its startup and dynamic buffer-address fixes.
 Build and run instructions, source attribution, and limitations are in
 [docs/neptune-integration.md](docs/neptune-integration.md).
 
-**Live rendering and FPS for this combined build are not yet verified.**
-The figures below describe earlier fork builds. The performance launcher
-is `tools/start-keywest.ps1`; use `-DryRun` to inspect its configuration.
+World loading has been confirmed, with remaining rendering and performance defects.
+Ocean simulation read-back is enabled so GPU water heights reach CPU buoyancy code.
+The launcher defaults to omitting one finest mip from eligible large textures to
+reduce memory and upload work; `-DropMips 0` restores full texture detail.
+The figures below describe earlier fork builds. The performance launcher is
+`tools/start-keywest.ps1`; use `-DryRun` to inspect its configuration.
 
 ## Credits
 
